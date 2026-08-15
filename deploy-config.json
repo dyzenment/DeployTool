@@ -1,0 +1,199 @@
+{
+  "$schema": "https://raw.githubusercontent.com/dyzenment/DeployTool/main/deploy-config.schema.json",
+  "projectsFolder": "src",
+  "unitTestsFolder": "tests",
+  "unitTestProjectSuffix": "UnitTest",
+  "doNotPublishIfNoPubInCommitMessage": false,
+  "servers": [],
+  "projects": [
+    {
+      "name": "Admin",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [
+            "vpk"
+          ],
+          "type": "Velopack",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "velopack": {
+            "packId": "Admin",
+            "delivery": "PackOnly"
+          }
+        }
+      ]
+    },
+    {
+      "name": "CrystalProcessor",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [
+            "vpk"
+          ],
+          "type": "Velopack",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "velopack": {
+            "packId": "CrystalProcessor",
+            "delivery": "PackOnly"
+          }
+        }
+      ]
+    },
+    {
+      "name": "NewFreightExecutive",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [
+            "vpk"
+          ],
+          "type": "Velopack",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "velopack": {
+            "packId": "NewFreightExecutive",
+            "delivery": "PackOnly"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Processor",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [
+            "vpk"
+          ],
+          "type": "Velopack",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "velopack": {
+            "packId": "Processor",
+            "delivery": "PackOnly"
+          }
+        }
+      ]
+    },
+    {
+      "name": "TestWebArea",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [],
+          "type": "Iis",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "iis": {
+            "siteName": "TestWebArea",
+            "deployPath": "C:\\inetpub\\TestWebArea",
+            "appPool": "TestWebArea"
+          }
+        }
+      ]
+    },
+    {
+      "name": "WebApi",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [],
+          "type": "Iis",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "iis": {
+            "siteName": "WebApi",
+            "deployPath": "C:\\inetpub\\WebApi",
+            "appPool": "WebApi"
+          }
+        }
+      ]
+    },
+    {
+      "name": "WebApp",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [],
+          "type": "Iis",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "iis": {
+            "siteName": "WebApp",
+            "deployPath": "C:\\inetpub\\WebApp",
+            "appPool": "WebApp"
+          }
+        }
+      ]
+    },
+    {
+      "name": "WriteCheck",
+      "disabled": false,
+      "runTests": true,
+      "abortOnUnitTestFailure": true,
+      "dependentProjects": [],
+      "targets": [
+        {
+          "prerequisites": [
+            "vpk"
+          ],
+          "type": "Velopack",
+          "build": {
+            "configuration": "Release",
+            "runtime": "win-x64"
+          },
+          "rollback": false,
+          "velopack": {
+            "packId": "WriteCheck",
+            "delivery": "PackOnly"
+          }
+        }
+      ]
+    }
+  ]
+}

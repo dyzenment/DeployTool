@@ -1,0 +1,156 @@
+# -----------------------------------------------------------------------------
+# Deploy workflow - template for consuming an app with Dytools.DeployTool.
+#
+# Copy this file into your APPLICATION repo at .github/workflows/deploy.yml.
+# It does NOT belong in the DeployTool repo itself (that repo deploys nothing).
+#
+# Prerequisites in the app repo:
+#   1. A deploy-config.json at the repo root (see deploy-config.example.json).
+#   2. A local tool manifest pinning the tool:
+#        dotnet new tool-manifest
+#        dotnet tool install Dytools.DeployTool
+#      Commit the resulting .config/dotnet-tools.json.
+#
+# The YAML stays intentionally minimal:
+#   1. .NET SDK setup
+#   2. Ensure git is installed (before checkout so clone creates .git)
+#   3. Checkout (fetch-depth 2 enables the HEAD~1 diff)
+#   4. Mark workspace as a git safe directory
+#   5. Compute the changed-file list (first-commit fallback = full deploy)
+#   6. dotnet tool restore  (brings back the pinned dytools-deploy)
+#   7. dytools-deploy       (does everything: resolve, build, test, publish, roll out, report)
+# -----------------------------------------------------------------------------
+
+name: Deploy
+
+on:
+  # Manual trigger with an optional "deploy everything" switch.
+  workflow_dispatch:
+    inputs:
+      force_all:
+        description: "Deploy all projects regardless of changed files"
+        required: false
+        default: "false"
+        type: boolean
+
+  # Deploy on push to main. Comment this out if you only want manual deploys.
+  push:
+    branches: [main]
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_GCConserveMemory: 9
+
+jobs:
+  deploy:
+    name: Deploy Applications
+    # Self-hosted: IIS and folder targets need network access to on-prem destinations.
+    # Cloud runners have no route to internal resources. Use a cloud runner only if all
+    # your targets are cloud-reachable (e.g. Velopack to Azure/S3).
+    runs-on: self-hosted
+
+    steps:
+      # -- 1. .NET SDK --------------------------------------------------------
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.x
+
+      # -- 2. Ensure git is installed -----------------------------------------
+      # Must run before checkout so actions/checkout uses a real git clone
+      # (with a .git folder) instead of the REST API fallback.
+      - name: Ensure git is installed
+        shell: powershell
+        run: |
+          if (Get-Command git -ErrorAction SilentlyContinue) {
+            Write-Host "git already available: $((Get-Command git).Source)"
+          } elseif (Test-Path "C:\\actions-runner\\git\\cmd\\git.exe") {
+            Write-Host "git found at C:\\actions-runner\\git -- adding to PATH"
+            Add-Content -Path $env:GITHUB_PATH -Value "C:\\actions-runner\\git\\cmd"
+            Add-Content -Path $env:GITHUB_PATH -Value "C:\\actions-runner\\git\\bin"
+          } else {
+            Write-Host "git not found -- fetching latest Git for Windows release..."
+            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -UseBasicParsing
+            $asset = $release.assets | Where-Object { $_.name -match "^Git-[\\d.]+-64-bit\\.exe$" } | Select-Object -First 1
+            if (-not $asset) { Write-Error "Could not find Git 64-bit installer in latest release."; exit 1 }
+            Write-Host "Downloading $($asset.name)..."
+            $installer = "$env:TEMP\\git-installer.exe"
+            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -UseBasicParsing
+            $gitDir = "C:\\actions-runner\\git"
+            Write-Host "Installing to $gitDir ..."
+            $proc = Start-Process $installer -ArgumentList "/VERYSILENT /NORESTART /NOCANCEL /SP- /DIR=`"$gitDir`" /PathOption=None" -Wait -PassThru
+            Write-Host "Installer exit code: $($proc.ExitCode)"
+            $gitExe = "$gitDir\\cmd\\git.exe"
+            if (-not (Test-Path $gitExe)) { Write-Error "git.exe not found at $gitExe after install."; exit 1 }
+            Remove-Item $installer -Force -ErrorAction SilentlyContinue
+            Add-Content -Path $env:GITHUB_PATH -Value "$gitDir\\cmd"
+            Add-Content -Path $env:GITHUB_PATH -Value "$gitDir\\bin"
+            Write-Host "Git $($release.tag_name) installed at $gitDir and added to PATH"
+          }
+
+      # -- 3. Checkout --------------------------------------------------------
+      # fetch-depth: 2 is required for the HEAD~1 diff in step 5.
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      # -- 4. Mark workspace as git safe directory ----------------------------
+      # Required when the runner service account differs from the repo owner.
+      - name: Set git safe directory
+        shell: powershell
+        run: |
+          git config --system --add safe.directory "$env:GITHUB_WORKSPACE"
+          Write-Host "Marked $env:GITHUB_WORKSPACE as git safe directory"
+
+      # -- 5. Compute changed files -------------------------------------------
+      # Pipe-delimited list written to GITHUB_OUTPUT; the tool parses it to decide
+      # which projects to deploy. First-commit fallback treats all files as changed.
+      - name: Get changed files
+        id: changed_files
+        shell: powershell
+        run: |
+          [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+          Set-Location $env:GITHUB_WORKSPACE
+          $parentCount = [int](cmd /c "git rev-list --count HEAD 2>nul")
+          if ($parentCount -le 1) {
+            Write-Host "First commit detected -- treating all tracked files as changed."
+            $files = cmd /c "git ls-files 2>nul"
+          } else {
+            $files = cmd /c "git diff --name-only HEAD~1 HEAD 2>nul"
+          }
+          if (-not $files) {
+            Write-Host "No changed files detected."
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "files="
+          } else {
+            Write-Host "Changed files ($(@($files).Count)):"
+            $files | ForEach-Object { Write-Host "  $_" }
+            $joined = $files -join ([char]124)
+            Add-Content -Path $env:GITHUB_OUTPUT -Value "files=$joined"
+          }
+          exit 0
+
+      # -- 6. Restore the tool ------------------------------------------------
+      # Reads .config/dotnet-tools.json and restores the pinned dytools-deploy.
+      - name: Restore deploy tool
+        shell: powershell
+        run: dotnet tool restore
+
+      # -- 7. Run the deploy tool ---------------------------------------------
+      # The tool handles everything: prerequisite installs, dependency resolution,
+      # build, test, publish, delivery, rollback, multi-server rollout, and reporting.
+      # It lowers its own process priority so it doesn't compete with live apps.
+      - name: Deploy
+        shell: powershell
+        env:
+          # Inject any secrets your deploy-config.json references via %VAR% expansion.
+          # Example (Velopack -> Azure Blob):
+          #   AZ_ACCOUNT: ${{ secrets.AZ_ACCOUNT }}
+          #   AZ_KEY: ${{ secrets.AZ_KEY }}
+          PLACEHOLDER: ""
+        run: |
+          dotnet dytools-deploy `
+            --config deploy-config.json `
+            --changed "${{ steps.changed_files.outputs.files }}" `
+            --force-all "${{ inputs.force_all }}"

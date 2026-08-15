@@ -1,0 +1,59 @@
+{
+  "$schema": "https://raw.githubusercontent.com/dyzenment/DeployTool/main/deploy-config.schema.json",
+  "projectsFolder": "src",
+  "unitTestsFolder": "tests",
+  "unitTestProjectSuffix": "UnitTest",
+  "noWarn": "CS8600,CS8618",
+  "doNotPublishIfNoPubInCommitMessage": true,
+
+  "servers": [
+    { "name": "web01", "hostname": "WEBSERVER01" },
+    { "name": "web02", "hostname": "WEBSERVER02", "incomingShare": "\\\\WEBSERVER02\\deploy\\incoming" }
+  ],
+  "rollout": { "delaySeconds": 600, "keepRuns": 5 },
+
+  "projects": [
+    {
+      "name": "WebApp",
+      "dependentProjects": ["Core", "*"],
+      "preBuild": ["npm ci", "npm run build"],
+      "targets": [
+        {
+          "type": "Iis",
+          "rollback": true,
+          "build": { "configuration": "Release", "runtime": "win-x64" },
+          "iis": {
+            "siteName": "MyWeb",
+            "deployPath": "C:\\inetpub\\MyWeb_A",
+            "secondaryDeployPath": "C:\\inetpub\\MyWeb_B",
+            "appPool": "MyWebPool",
+            "warmupUrl": "http://localhost/health"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Desktop",
+      "runTests": false,
+      "targets": [
+        {
+          "type": "Velopack",
+          "prerequisites": ["vpk"],
+          "build": { "configuration": "Release", "runtime": "win-x64" },
+          "velopack": {
+            "packId": "MyApp",
+            "packTitle": "My App",
+            "delivery": "DownloadPackAndUpload",
+            "source": {
+              "type": "Az",
+              "account": "%AZ_ACCOUNT%",
+              "key": "%AZ_KEY%",
+              "container": "releases",
+              "keepMaxReleases": 10
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

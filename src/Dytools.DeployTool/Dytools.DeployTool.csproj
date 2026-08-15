@@ -1,0 +1,50 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>Dytools.DeployTool</RootNamespace>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Optimize>true</Optimize>
+        <!-- Framework-dependent: the tool runs against the .NET runtime already on the host. -->
+        <SelfContained>false</SelfContained>
+        <!-- Emit XML docs so the schema generator can turn the model's doc-comments into
+             field descriptions (hover help in editors). CS1591 = missing doc on a public
+             member; CS1573 = partial param docs. Not worth annotating every one. -->
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <NoWarn>$(NoWarn);CS1591;CS1573</NoWarn>
+    </PropertyGroup>
+
+    <!-- Pack as a .NET tool: `dotnet pack` produces a tool package that installs the
+         `dytools-deploy` command via `dotnet tool install`/`dotnet tool restore`. -->
+    <PropertyGroup>
+        <PackAsTool>true</PackAsTool>
+        <ToolCommandName>dytools-deploy</ToolCommandName>
+    </PropertyGroup>
+
+    <!-- NuGet package metadata (shown on the nuget.org listing). -->
+    <PropertyGroup>
+        <PackageId>Dytools.DeployTool</PackageId>
+        <Version>1.0.0</Version>
+        <Authors>Michael Shaffer</Authors>
+        <Copyright>Copyright © 2026 Michael Shaffer</Copyright>
+        <Description>A config-driven .NET tool for deploying .NET applications across one or more servers. Reads a single deploy-config.json, diffs changed files against the project dependency graph to decide what needs deploying, runs unit-test gates and prerequisite installs, then plans and applies a staged rollout - IIS app pools, folder copies, or Velopack packages - with commit-message directives, peer soak delays, rollback, and a full run report.</Description>
+        <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+        <PackageProjectUrl>https://github.com/dyzenment/DeployTool</PackageProjectUrl>
+        <RepositoryUrl>https://github.com/dyzenment/DeployTool.git</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageTags>deployment;dotnet-tool;iis;velopack;ci-cd;self-hosted;rollout</PackageTags>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+    </PropertyGroup>
+
+    <!-- Ship the repo README as the package README on nuget.org. -->
+    <ItemGroup>
+      <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    </ItemGroup>
+
+    <!-- No external NuGet dependencies by design.
+         IIS app pool management uses appcmd.exe (available on any IIS host).
+         Add Microsoft.Web.Administration here if programmatic IIS control is needed later. -->
+
+</Project>

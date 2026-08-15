@@ -1,0 +1,26 @@
+<Solution>
+  <Folder Name="/config/">
+    <File Path=".github\workflows\ci.yml" />
+    <File Path=".github\workflows\publish.yml" />
+    <File Path=".gitignore" />
+  </Folder>
+  <Folder Name="/docs/">
+    <File Path="deploy-config.schema.json" />
+    <File Path="docs\ARCHITECTURE.md" />
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/examples/">
+    <File Path="examples\deploy-config.example.json" />
+    <File Path="examples\deploy.yml" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src\Dytools.DeployTool\Dytools.DeployTool.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests\Dytools.DeployToolUnitTest\Dytools.DeployToolUnitTest.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools\Dytools.SchemaGen\Dytools.SchemaGen.csproj" />
+  </Folder>
+</Solution>

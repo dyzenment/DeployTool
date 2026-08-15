@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - run: dotnet restore
+
+      - run: dotnet build --no-restore -c Release
+
+      - run: dotnet test --no-build -c Release
+
+      # The schema is generated from the config models - fail if the committed copy is stale.
+      - name: Verify deploy-config.schema.json is up to date
+        run: |
+          dotnet run --project tools/Dytools.SchemaGen -c Release -- deploy-config.schema.json
+          git diff --exit-code deploy-config.schema.json

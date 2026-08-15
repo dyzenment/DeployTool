@@ -1,0 +1,555 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "Dytools.DeployTool deploy-config.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "projectsFolder": {
+      "type": "string",
+      "description": "Relative path from repo root to the folder containing all deployable\nproject subdirectories. Each project lives at {projectsFolder}/{project.name}/."
+    },
+    "unitTestsFolder": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "description": "Relative path from repo root to the folder containing unit test projects.\nConvention lookup: {unitTestsFolder}/{projectName}{unitTestProjectSuffix}/\nExample: \u0022tests/\u0022"
+    },
+    "unitTestProjectSuffix": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "description": "Suffix appended to a project name to find its unit test project by convention.\nExample: \u0022UnitTest\u0022 \u2192 Admin project \u2192 tests/AdminUnitTest/AdminUnitTest.csproj"
+    },
+    "noWarn": {
+      "type": [
+        "null",
+        "string"
+      ],
+      "description": "Repo-wide warning codes to suppress on every dotnet publish call.\nConcatenated with any noWarn defined on individual build configs.\nExample: \u0022CS8600,CS8601,CS8602,CS8618\u0022"
+    },
+    "packCache": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/definitions/PackCacheConfig"
+        }
+      ]
+    },
+    "doNotPublishIfNoPubInCommitMessage": {
+      "type": "boolean",
+      "description": "When true, a commit with no pub: directive deploys nothing \u2014 publishing becomes\nopt-in per commit. Use pub:* to deploy everything, pub:none to deploy nothing.\n            \nThe --force-all flag still overrides this: it is an explicit manual action, and a\nbutton that silently did nothing would be worse than the safety it bought.\nDefault: false \u2014 changed-file resolution behaves as it always has."
+    },
+    "servers": {
+      "type": "array",
+      "description": "The server fleet. Empty (the default) means single-box: the tool behaves exactly as\nit always has, with no propagation.\n            \nThere is no \u0022primary\u0022 flag: whichever box the deploy job lands on is the primary for\nthat run, and every other listed server is a peer. Identity is resolved by matching\nhostname, so any box can fill either role without a config change.",
+      "items": {
+        "$ref": "#/definitions/ServerConfig"
+      }
+    },
+    "rollout": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/definitions/RolloutConfig"
+        }
+      ]
+    },
+    "projects": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/ProjectConfig"
+      }
+    },
+    "$schema": {
+      "type": "string",
+      "description": "Path or URL of this JSON Schema, so editors bind autocomplete and validation."
+    }
+  },
+  "definitions": {
+    "PackCacheConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Path with supported tokens:\n  {CommonAppData} \u2192 writable local app data (always writable, no elevation)\n                     Windows (NetworkService): C:\\Windows\\ServiceProfiles\\NetworkService\\AppData\\Local\n                     macOS: ~/Library/Application Support\n                     Linux: ~/.local/share\n  {packId}        \u2192 replaced with the velopack.packId value\n  %ENV_VAR%       \u2192 environment variable expansion"
+        },
+        "keepReleases": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Maximum number of historical releases to retain per packId.",
+          "format": "int32"
+        }
+      }
+    },
+    "ServerConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Short reference for this box, used in logs, manifests, and reports."
+        },
+        "hostname": {
+          "type": "string",
+          "description": "Matched case-insensitively against Environment.MachineName to decide which entry\nthe running box is. Zero per-machine configuration."
+        },
+        "incomingShare": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Where the primary drops run folders for this peer, e.g. \u0022\\\\WEBSERVER02\\deploy\\incoming\u0022.\nUnused for whichever server is currently the primary (it applies inline from staging)."
+        }
+      }
+    },
+    "RolloutConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delaySeconds": {
+          "type": "integer",
+          "description": "Soak time between the primary going live and peers applying the build. The clock\nstarts at primary success, not at plan time \u2014 see Planner. Overridden per commit\nwith wait:N.",
+          "format": "int32"
+        },
+        "keepRuns": {
+          "type": "integer",
+          "description": "Run folders retained per peer before the oldest are pruned.",
+          "format": "int32"
+        }
+      }
+    },
+    "ProjectConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Must match the subfolder name and .csproj filename under projectsFolder."
+        },
+        "disabled": {
+          "type": "boolean",
+          "description": "When true, this project is excluded from all deploy runs without removing it.\nDisabled projects skip the existence check \u2014 the folder does not need to exist."
+        },
+        "runTests": {
+          "type": "boolean",
+          "description": "When false, unit tests are skipped for this project.\nDefault: true."
+        },
+        "abortOnUnitTestFailure": {
+          "type": "boolean",
+          "description": "When true, a unit test failure aborts deployment of this project.\nWhen false, test failures are logged but deployment continues.\nDefault: true."
+        },
+        "unitTestProject": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Override for the unit test project. Can be:\n  - A project name:           \u0022AdminUnitTest\u0022\n  - A repo-root-relative path: \u0022tests/AdminUnitTest/AdminUnitTest.csproj\u0022\nIf absent, the convention is used: {unitTestsFolder}/{name}{unitTestProjectSuffix}/"
+        },
+        "dependentProjects": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ],
+          "description": "Additional change triggers beyond this project\u0027s own folder.\n\u0022ProjectName\u0022 \u2014 triggers if any file in that project folder changed.\n\u0022some/path\u0022   \u2014 substring match against any changed file path.\n\u0022*\u0022           \u2014 catch-all: any solution-level change (outside all project folders).\n.csproj ProjectReferences are resolved automatically \u2014 no need to repeat them here."
+        },
+        "preBuild": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "description": "Shell commands to run in the project folder before any targets build.\nIf present, replaces the default auto npm install behavior.\nDefault: if package.json exists, \u0022npm install\u0022 runs automatically.",
+          "items": {
+            "type": "string"
+          }
+        },
+        "noWarn": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Warning codes to suppress for this project\u0027s builds and tests.\nConcatenated with the repo-wide noWarn from the root config.\nExample: \u0022NU1701,CS0618\u0022"
+        },
+        "targets": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/TargetConfig"
+          }
+        }
+      }
+    },
+    "TargetConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prerequisites": {
+          "type": "array",
+          "description": "Software prerequisites required by this target.\nInstalled automatically if missing. Only for selected targets.\nSupported: \u0022nodejs\u0022, \u0022vpk\u0022",
+          "items": {
+            "type": "string"
+          }
+        },
+        "type": {
+          "$ref": "#/definitions/DeployType"
+        },
+        "build": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/BuildConfig"
+            }
+          ]
+        },
+        "rollback": {
+          "type": "boolean",
+          "description": "Whether to snapshot before deploying and restore on failure.\nDefault: false."
+        },
+        "velopack": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/VelopackConfig"
+            }
+          ]
+        },
+        "iis": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/IisConfig"
+            }
+          ]
+        },
+        "folder": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/FolderConfig"
+            }
+          ]
+        }
+      }
+    },
+    "DeployType": {
+      "type": "string",
+      "description": "",
+      "x-enumNames": [
+        "Velopack",
+        "Iis",
+        "Folder"
+      ],
+      "enum": [
+        "Velopack",
+        "Iis",
+        "Folder"
+      ]
+    },
+    "BuildConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "configuration": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "selfContained": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "targetFramework": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Target framework moniker to build for.\nRequired when the project has multiple target frameworks (TargetFrameworks).\nOptional for single-target projects \u2014 inferred from the .csproj if absent.\nExamples: \u0022net8.0-windows\u0022, \u0022net481\u0022, \u0022net8.0\u0022\nFor .NET Framework projects this triggers msbuild instead of dotnet publish."
+        },
+        "singleFile": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "noWarn": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Comma-separated list of warning codes to suppress during build.\nExample: \u0022CS8600,CS8601,CS8602,CS8618\u0022\nPassed to dotnet publish as /nowarn:{value}"
+        }
+      }
+    },
+    "VelopackConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "packId": {
+          "type": "string"
+        },
+        "packTitle": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "icon": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Optional icon path override. Can be repo-root-relative, project-relative, or absolute.\nIf absent, uses the ApplicationIcon discovered from the .csproj at startup.\nIcon retry logic: tries configured extension \u2192 .icns \u2192 no icon."
+        },
+        "channel": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "runtime": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Velopack runtime identifier. Cross-compilation directive ([win]/[osx]/[linux])\nis automatically injected when the target OS differs from the runner OS."
+        },
+        "framework": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "mainExe": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "delivery": {
+          "$ref": "#/definitions/VelopackDelivery"
+        },
+        "source": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/VelopackSource"
+            }
+          ]
+        }
+      }
+    },
+    "VelopackDelivery": {
+      "type": "string",
+      "description": "",
+      "x-enumNames": [
+        "PackOnly",
+        "DownloadAndPack",
+        "DownloadPackAndUpload"
+      ],
+      "enum": [
+        "PackOnly",
+        "DownloadAndPack",
+        "DownloadPackAndUpload"
+      ]
+    },
+    "VelopackSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/VelopackSourceType"
+        },
+        "account": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "key": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "sas": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "container": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "keyId": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "secret": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "region": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "bucket": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "prefix": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "endpoint": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "repoUrl": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "token": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "path": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "url": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "keepMaxReleases": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        }
+      }
+    },
+    "VelopackSourceType": {
+      "type": "string",
+      "description": "",
+      "x-enumNames": [
+        "Az",
+        "S3",
+        "GitHub",
+        "Gitea",
+        "Local",
+        "Http"
+      ],
+      "enum": [
+        "Az",
+        "S3",
+        "GitHub",
+        "Gitea",
+        "Local",
+        "Http"
+      ]
+    },
+    "IisConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "siteName": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "IIS site name, e.g. \u0022MyWeb\u0022. Required only for blue-green (secondaryDeployPath),\nbecause the site is what gets flipped between slots."
+        },
+        "deployPath": {
+          "type": "string",
+          "description": "Slot A. In classic (single-slot) mode this is simply the deploy destination."
+        },
+        "secondaryDeployPath": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Slot B. Setting this enables blue-green: the artifact is mirrored into whichever\nslot is NOT currently live (so the app pool is never stopped during the copy),\nthen the site\u0027s physicalPath is flipped to it.\n            \nOmit for the original behavior: stop pool \u2192 mirror in place \u2192 start pool.\n            \nThere is deliberately no secondaryAppPool. Warmup cannot survive an app pool swap\n(an IIS app domain is keyed by site \u002B app path \u002B pool), so a second pool would buy\nnothing here. Preserving warmup across a cutover requires shuffling bindings\nbetween two separate sites, which is a much larger IIS setup."
+        },
+        "appPool": {
+          "type": "string"
+        },
+        "warmupUrl": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Optional URL hit immediately after the flip so the app\u0027s cold start lands on this\nrequest rather than a real user\u0027s. A non-success response is treated as a failed\ndeploy and triggers an automatic flip back to the previous slot."
+        }
+      }
+    },
+    "FolderConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "destinationPath": {
+          "type": "string"
+        },
+        "serviceName": {
+          "type": [
+            "null",
+            "string"
+          ]
+        }
+      }
+    }
+  }
+}
