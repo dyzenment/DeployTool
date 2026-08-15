@@ -41,7 +41,7 @@
     },
     "doNotPublishIfNoPubInCommitMessage": {
       "type": "boolean",
-      "description": "When true, a commit with no pub: directive deploys nothing \u2014 publishing becomes\nopt-in per commit. Use pub:* to deploy everything, pub:none to deploy nothing.\n            \nThe --force-all flag still overrides this: it is an explicit manual action, and a\nbutton that silently did nothing would be worse than the safety it bought.\nDefault: false \u2014 changed-file resolution behaves as it always has."
+      "description": "When true, a commit with no pub: directive deploys nothing - publishing becomes\nopt-in per commit. Use pub:* to deploy everything, pub:none to deploy nothing.\n            \nThe --force-all flag still overrides this: it is an explicit manual action, and a\nbutton that silently did nothing would be worse than the safety it bought.\nDefault: false - changed-file resolution behaves as it always has."
     },
     "servers": {
       "type": "array",
@@ -117,7 +117,7 @@
       "properties": {
         "delaySeconds": {
           "type": "integer",
-          "description": "Soak time between the primary going live and peers applying the build. The clock\nstarts at primary success, not at plan time \u2014 see Planner. Overridden per commit\nwith wait:N.",
+          "description": "Soak time between the primary going live and peers applying the build. The clock\nstarts at primary success, not at plan time - see Planner. Overridden per commit\nwith wait:N.",
           "format": "int32"
         },
         "keepRuns": {
@@ -137,7 +137,7 @@
         },
         "disabled": {
           "type": "boolean",
-          "description": "When true, this project is excluded from all deploy runs without removing it.\nDisabled projects skip the existence check \u2014 the folder does not need to exist."
+          "description": "When true, this project is excluded from all deploy runs without removing it.\nDisabled projects skip the existence check - the folder does not need to exist."
         },
         "runTests": {
           "type": "boolean",
@@ -166,7 +166,7 @@
               }
             }
           ],
-          "description": "Additional change triggers beyond this project\u0027s own folder.\n\u0022ProjectName\u0022 \u2014 triggers if any file in that project folder changed.\n\u0022some/path\u0022   \u2014 substring match against any changed file path.\n\u0022*\u0022           \u2014 catch-all: any solution-level change (outside all project folders).\n.csproj ProjectReferences are resolved automatically \u2014 no need to repeat them here."
+          "description": "Additional change triggers beyond this project\u0027s own folder.\n\u0022ProjectName\u0022 - triggers if any file in that project folder changed.\n\u0022some/path\u0022   - substring match against any changed file path.\n\u0022*\u0022           - catch-all: any solution-level change (outside all project folders).\n.csproj ProjectReferences are resolved automatically - no need to repeat them here."
         },
         "preBuild": {
           "type": [
@@ -291,7 +291,7 @@
             "null",
             "string"
           ],
-          "description": "Target framework moniker to build for.\nRequired when the project has multiple target frameworks (TargetFrameworks).\nOptional for single-target projects \u2014 inferred from the .csproj if absent.\nExamples: \u0022net8.0-windows\u0022, \u0022net481\u0022, \u0022net8.0\u0022\nFor .NET Framework projects this triggers msbuild instead of dotnet publish."
+          "description": "Target framework moniker to build for.\nRequired when the project has multiple target frameworks (TargetFrameworks).\nOptional for single-target projects - inferred from the .csproj if absent.\nExamples: \u0022net8.0-windows\u0022, \u0022net481\u0022, \u0022net8.0\u0022\nFor .NET Framework projects this triggers msbuild instead of dotnet publish."
         },
         "singleFile": {
           "type": [
