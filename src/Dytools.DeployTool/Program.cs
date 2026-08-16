@@ -13,10 +13,12 @@ internal class Program
 {
     public static async Task<int> Main(string[] args)
     {
-        // Lower this process's priority immediately so the deploy pipeline doesn't compete
-        // with live application processes on the production server. ProcessRunner applies the
-        // same priority to every child process spawned during the build.
-        Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.BelowNormal;
+        // Lower this process's priority before anything else runs, so the deploy pipeline
+        // doesn't compete with live application processes on the production server. Child
+        // processes inherit the priority they are created with, so the earlier this happens
+        // the fewer of them escape at Normal. The full policy - core count, build servers,
+        // background I/O - is applied once deploy-config.json has been read, below.
+        ResourceGovernor.ApplyDefaultPriority();
 
         // `init` (alias --makeconfig) scaffolds/edits a deploy-config.json; `edit <file>` opens an
         // existing one. Checked before the --config requirement below so they run in a fresh repo.
@@ -70,6 +72,12 @@ internal class Program
         var configJson   = await File.ReadAllTextAsync(configPath);
         var deployConfig = JsonSerializer.Deserialize<DeployConfig>(configJson, JsonOptions.Default)
             ?? throw new InvalidOperationException("Failed to deserialize deploy-config.json.");
+
+        // Apply the full resource policy now that config is available. Everything spawned from
+        // here on inherits it - priority through process creation, the build-server and GC
+        // opt-outs through the environment.
+        ResourceGovernor.Apply(deployConfig.Resources);
+        Console.WriteLine($"  Resources:   {ResourceGovernor.Describe()}");
 
         // -- Filter disabled projects -------------------------------------------
 
@@ -477,9 +485,13 @@ internal class Program
             // Run the tests
             var noWarnArg  = !string.IsNullOrWhiteSpace(project.NoWarn)
                 ? $" /nowarn:{project.NoWarn}" : string.Empty;
+            // MsBuildSwitches matters here as much as on the build: dotnet test runs a full
+            // build first, and without them it would spin up the very node-reuse and shared
+            // compiler daemons the build path is careful to avoid.
             var testResult = await ProcessRunner.RunDotnetAsync(
                 $"test {testName}",
-                $"test \"{csprojPath}\" -c Release --logger \"console;verbosity=normal\"{noWarnArg}");
+                $"test \"{csprojPath}\" -c Release {ResourceGovernor.MsBuildSwitches} " +
+                $"--logger \"console;verbosity=normal\"{noWarnArg}");
             result.TestResults.Add(testResult);
 
             if (testResult.Success)

@@ -12,13 +12,16 @@
 #      Commit the resulting .config/dotnet-tools.json.
 #
 # The YAML stays intentionally minimal:
-#   1. .NET SDK setup
-#   2. Ensure git is installed (before checkout so clone creates .git)
+#   1. Ensure git is installed (also provides bash for every later step)
+#   2. .NET SDK setup (skipped when the runner already has a 10.x SDK)
 #   3. Checkout (fetch-depth 2 enables the HEAD~1 diff)
 #   4. Mark workspace as a git safe directory
 #   5. Compute the changed-file list (first-commit fallback = full deploy)
 #   6. dotnet tool restore  (brings back the pinned dytools-deploy)
 #   7. dytools-deploy       (does everything: resolve, build, test, publish, roll out, report)
+#
+# Every step runs under bash (see defaults.run.shell) EXCEPT step 1, which
+# cannot: on Windows `shell: bash` resolves to the Git Bash that step 1 installs.
 # -----------------------------------------------------------------------------
 
 name: Deploy
@@ -49,92 +52,164 @@ jobs:
     # your targets are cloud-reachable (e.g. Velopack to Azure/S3).
     runs-on: self-hosted
 
+    defaults:
+      run:
+        # Windows runners default to PowerShell 5.1, which has no && or || operators.
+        # Pin bash so one script body works on both self-hosted Windows and Linux.
+        shell: bash
+
     steps:
-      # -- 1. .NET SDK --------------------------------------------------------
+      # -- 1. Ensure git AND Git Bash are on PATH (Windows only) --------------
+      # Must run first, and it must guarantee bash, not merely git:
+      #
+      #   * actions/checkout needs a real git clone (with a .git folder) rather
+      #     than the REST API fallback.
+      #   * Every bash step below needs the Git Bash that ships with Git for
+      #     Windows. `shell: bash` is resolved by a plain PATH lookup, and
+      #     C:\Windows\System32\bash.exe -- the WSL launcher -- will win that
+      #     lookup and fail with "no installed distributions". Git for Windows'
+      #     installer normally adds only <GitRoot>\cmd to PATH, which holds
+      #     git.exe but NOT bash.exe, so finding git proves nothing about bash.
+      #     GITHUB_PATH prepends, so publishing <GitRoot>\bin here puts the real
+      #     bash ahead of the System32 stub.
+      #
+      # This is the one step that stays in PowerShell, since bash may not exist
+      # yet when it runs -- which is also why it is the only step that is not
+      # cross-platform. Linux and macOS runners already have git and a native
+      # bash, so it is skipped there.
+      - name: Ensure git is installed
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          # Publish <root>\bin (bash.exe, sh.exe) and <root>\cmd (git.exe) to PATH.
+          # Returns $true only if this root actually provides Git Bash.
+          function Publish-GitRoot([string]$root) {
+            if (-not $root) { return $false }
+            $bin = Join-Path $root 'bin'
+            $cmd = Join-Path $root 'cmd'
+            if (-not (Test-Path (Join-Path $bin 'bash.exe'))) { return $false }
+            Add-Content -Path $env:GITHUB_PATH -Value $bin
+            if (Test-Path (Join-Path $cmd 'git.exe')) {
+              Add-Content -Path $env:GITHUB_PATH -Value $cmd
+            }
+            Write-Host "Using Git at $root"
+            Write-Host "  bash -> $(Join-Path $bin 'bash.exe')"
+            return $true
+          }
+
+          # Candidate install roots, best first. A git.exe already on PATH lives in
+          # <root>\cmd or <root>\bin, so its grandparent directory is the root.
+          $roots = @()
+          $onPath = Get-Command git -ErrorAction SilentlyContinue
+          if ($onPath) {
+            Write-Host "git already on PATH: $($onPath.Source)"
+            $roots += Split-Path (Split-Path $onPath.Source -Parent) -Parent
+          }
+          $roots += 'C:\actions-runner\git'
+          if ($env:ProgramFiles) { $roots += (Join-Path $env:ProgramFiles 'Git') }
+          if (${env:ProgramFiles(x86)}) { $roots += (Join-Path ${env:ProgramFiles(x86)} 'Git') }
+          if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Programs\Git') }
+
+          foreach ($root in $roots) {
+            if (Publish-GitRoot $root) { exit 0 }
+          }
+
+          Write-Host "No Git for Windows install with bash.exe found -- fetching latest release..."
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -UseBasicParsing
+          $asset = $release.assets | Where-Object { $_.name -match "^Git-[\d.]+-64-bit\.exe$" } | Select-Object -First 1
+          if (-not $asset) { Write-Host "::error::Could not find Git 64-bit installer in latest release."; exit 1 }
+          Write-Host "Downloading $($asset.name)..."
+          $installer = "$env:TEMP\git-installer.exe"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -UseBasicParsing
+          $gitDir = 'C:\actions-runner\git'
+          Write-Host "Installing to $gitDir ..."
+          $proc = Start-Process $installer -ArgumentList "/VERYSILENT /NORESTART /NOCANCEL /SP- /DIR=`"$gitDir`" /PathOption=None" -Wait -PassThru
+          Write-Host "Installer exit code: $($proc.ExitCode)"
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          if (-not (Publish-GitRoot $gitDir)) {
+            Write-Host "::error::Git installed to $gitDir but bin\bash.exe is missing."
+            exit 1
+          }
+          Write-Host "Git $($release.tag_name) installed at $gitDir"
+
+      # -- 2. .NET SDK --------------------------------------------------------
+      # Self-hosted runners usually already have the SDK. Probing first avoids a
+      # multi-hundred-MB download on every run. The `if` swallows a missing dotnet,
+      # so no continue-on-error is needed.
+      - name: Check for an existing .NET 10 SDK
+        id: have_sdk
+        run: |
+          if dotnet --list-sdks 2>/dev/null | grep -q '^10\.'; then
+            echo "Found a 10.x SDK -- skipping setup-dotnet."
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No 10.x SDK on PATH -- setup-dotnet will install one."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup .NET SDK
-        uses: actions/setup-dotnet@v4
+        if: steps.have_sdk.outputs.ok != 'true'
+        uses: actions/setup-dotnet@v6
+        env:
+          # setup-dotnet installs to %PROGRAMFILES%\dotnet on Windows, which a
+          # non-admin runner service account cannot write to. Redirect it to the
+          # runner's own tool cache: writable by definition, and persists between
+          # runs. The action exports DOTNET_ROOT and prepends PATH from this value,
+          # so later steps find dotnet without needing the variable themselves.
+          # Note: `runner` context is unavailable in job-level env, only step-level.
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
         with:
           dotnet-version: |
             10.0.x
 
-      # -- 2. Ensure git is installed -----------------------------------------
-      # Must run before checkout so actions/checkout uses a real git clone
-      # (with a .git folder) instead of the REST API fallback.
-      - name: Ensure git is installed
-        shell: powershell
-        run: |
-          if (Get-Command git -ErrorAction SilentlyContinue) {
-            Write-Host "git already available: $((Get-Command git).Source)"
-          } elseif (Test-Path "C:\\actions-runner\\git\\cmd\\git.exe") {
-            Write-Host "git found at C:\\actions-runner\\git -- adding to PATH"
-            Add-Content -Path $env:GITHUB_PATH -Value "C:\\actions-runner\\git\\cmd"
-            Add-Content -Path $env:GITHUB_PATH -Value "C:\\actions-runner\\git\\bin"
-          } else {
-            Write-Host "git not found -- fetching latest Git for Windows release..."
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -UseBasicParsing
-            $asset = $release.assets | Where-Object { $_.name -match "^Git-[\\d.]+-64-bit\\.exe$" } | Select-Object -First 1
-            if (-not $asset) { Write-Error "Could not find Git 64-bit installer in latest release."; exit 1 }
-            Write-Host "Downloading $($asset.name)..."
-            $installer = "$env:TEMP\\git-installer.exe"
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer -UseBasicParsing
-            $gitDir = "C:\\actions-runner\\git"
-            Write-Host "Installing to $gitDir ..."
-            $proc = Start-Process $installer -ArgumentList "/VERYSILENT /NORESTART /NOCANCEL /SP- /DIR=`"$gitDir`" /PathOption=None" -Wait -PassThru
-            Write-Host "Installer exit code: $($proc.ExitCode)"
-            $gitExe = "$gitDir\\cmd\\git.exe"
-            if (-not (Test-Path $gitExe)) { Write-Error "git.exe not found at $gitExe after install."; exit 1 }
-            Remove-Item $installer -Force -ErrorAction SilentlyContinue
-            Add-Content -Path $env:GITHUB_PATH -Value "$gitDir\\cmd"
-            Add-Content -Path $env:GITHUB_PATH -Value "$gitDir\\bin"
-            Write-Host "Git $($release.tag_name) installed at $gitDir and added to PATH"
-          }
-
       # -- 3. Checkout --------------------------------------------------------
       # fetch-depth: 2 is required for the HEAD~1 diff in step 5.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 2
 
       # -- 4. Mark workspace as git safe directory ----------------------------
       # Required when the runner service account differs from the repo owner.
+      # --system needs write access to the system gitconfig; fall back to --global,
+      # which is always writable by the account the runner executes as.
       - name: Set git safe directory
-        shell: powershell
         run: |
-          git config --system --add safe.directory "$env:GITHUB_WORKSPACE"
-          Write-Host "Marked $env:GITHUB_WORKSPACE as git safe directory"
+          git config --system --add safe.directory "$GITHUB_WORKSPACE" 2>/dev/null \
+            || git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "Marked $GITHUB_WORKSPACE as git safe directory"
 
       # -- 5. Compute changed files -------------------------------------------
       # Pipe-delimited list written to GITHUB_OUTPUT; the tool parses it to decide
       # which projects to deploy. First-commit fallback treats all files as changed.
       - name: Get changed files
         id: changed_files
-        shell: powershell
         run: |
-          [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
-          Set-Location $env:GITHUB_WORKSPACE
-          $parentCount = [int](cmd /c "git rev-list --count HEAD 2>nul")
-          if ($parentCount -le 1) {
-            Write-Host "First commit detected -- treating all tracked files as changed."
-            $files = cmd /c "git ls-files 2>nul"
-          } else {
-            $files = cmd /c "git diff --name-only HEAD~1 HEAD 2>nul"
-          }
-          if (-not $files) {
-            Write-Host "No changed files detected."
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "files="
-          } else {
-            Write-Host "Changed files ($(@($files).Count)):"
-            $files | ForEach-Object { Write-Host "  $_" }
-            $joined = $files -join ([char]124)
-            Add-Content -Path $env:GITHUB_OUTPUT -Value "files=$joined"
-          }
-          exit 0
+          cd "$GITHUB_WORKSPACE"
+
+          count=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+          count=${count:-0}
+
+          if [ "$count" -le 1 ]; then
+            echo "First commit detected -- treating all tracked files as changed."
+            files=$(git ls-files 2>/dev/null || true)
+          else
+            files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+          fi
+
+          if [ -z "$files" ]; then
+            echo "No changed files detected."
+            echo "files=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed files ($(printf '%s\n' "$files" | wc -l | tr -d ' ')):"
+            printf '%s\n' "$files" | sed 's/^/  /'
+            joined=$(printf '%s' "$files" | tr -d '\r' | tr '\n' '|')
+            echo "files=$joined" >> "$GITHUB_OUTPUT"
+          fi
 
       # -- 6. Restore the tool ------------------------------------------------
       # Reads .config/dotnet-tools.json and restores the pinned dytools-deploy.
       - name: Restore deploy tool
-        shell: powershell
         run: dotnet tool restore
 
       # -- 7. Run the deploy tool ---------------------------------------------
@@ -142,15 +217,19 @@ jobs:
       # build, test, publish, delivery, rollback, multi-server rollout, and reporting.
       # It lowers its own process priority so it doesn't compete with live apps.
       - name: Deploy
-        shell: powershell
         env:
+          # Passed through the environment rather than interpolated into the script
+          # body, so a branch containing an oddly-named file cannot inject shell.
+          CHANGED_FILES: ${{ steps.changed_files.outputs.files }}
+          # inputs.* is empty on push events; default to false there.
+          FORCE_ALL: ${{ inputs.force_all || 'false' }}
           # Inject any secrets your deploy-config.json references via %VAR% expansion.
           # Example (Velopack -> Azure Blob):
           #   AZ_ACCOUNT: ${{ secrets.AZ_ACCOUNT }}
           #   AZ_KEY: ${{ secrets.AZ_KEY }}
           PLACEHOLDER: ""
         run: |
-          dotnet dytools-deploy `
-            --config deploy-config.json `
-            --changed "${{ steps.changed_files.outputs.files }}" `
-            --force-all "${{ inputs.force_all }}"
+          dotnet dytools-deploy \
+            --config deploy-config.json \
+            --changed "$CHANGED_FILES" \
+            --force-all "$FORCE_ALL"

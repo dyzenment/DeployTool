@@ -57,9 +57,7 @@ public static class BuildHelper
             "/t:Build",
             $"/p:Configuration={build.Configuration}",
             $"/p:OutputPath=\"{outputDir}\"",
-            "/p:UseSharedCompilation=false",
-            "/nodeReuse:false",
-            "/maxcpucount:1"
+            ResourceGovernor.MsBuildSwitches
         };
 
         if (!string.IsNullOrWhiteSpace(tfm))
@@ -84,9 +82,7 @@ public static class BuildHelper
             $"\"{csproj}\"",
             $"-c {build.Configuration}",
             $"-o \"{outputDir}\"",
-            "-p:UseSharedCompilation=false",
-            "-nodeReuse:false",
-            "-maxcpucount:1"
+            ResourceGovernor.MsBuildSwitches
         };
 
         if (!string.IsNullOrWhiteSpace(tfm))

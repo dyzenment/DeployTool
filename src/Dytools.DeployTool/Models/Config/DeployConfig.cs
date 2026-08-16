@@ -43,6 +43,14 @@ public sealed class DeployConfig
     public PackCacheConfig? PackCache { get; set; }
 
     /// <summary>
+    /// How hard the deploy pipeline should work to stay out of the way of the applications
+    /// already running on this box. Omit the block to accept the defaults, which are already
+    /// conservative: below-normal priority, one build core, no build server processes.
+    /// </summary>
+    [JsonPropertyName("resources")]
+    public ResourceConfig? Resources { get; set; }
+
+    /// <summary>
     /// When true, a commit with no pub: directive deploys nothing - publishing becomes
     /// opt-in per commit. Use pub:* to deploy everything, pub:none to deploy nothing.
     ///
@@ -70,6 +78,68 @@ public sealed class DeployConfig
     [JsonPropertyName("projects")]
     public List<ProjectConfig> Projects { get; set; } = [];
 }
+
+// -----------------------------------------------------------------------------
+// Resource governance
+// -----------------------------------------------------------------------------
+
+/// <summary>
+/// Caps on what a deploy is allowed to take from the box it runs on. Applied by
+/// ResourceGovernor at startup; priority and environment both inherit, so these settings
+/// reach every process the deploy spawns, not just the ones this tool launches directly.
+/// </summary>
+public sealed class ResourceConfig
+{
+    /// <summary>
+    /// Scheduling priority for the deploy and everything it spawns.
+    /// "BelowNormal" (default) yields to live applications while still making steady progress.
+    /// "Idle" runs only on otherwise-spare cycles - safest for a busy production box, but a
+    /// deploy can take substantially longer. "Normal" opts out entirely.
+    /// </summary>
+    [JsonPropertyName("priority")]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public ProcessPriority Priority { get; set; } = ProcessPriority.BelowNormal;
+
+    /// <summary>
+    /// Windows only. Puts the deploy process into background mode, which lowers I/O and memory
+    /// priority as well as CPU - a priority class covers CPU alone. This governs the file
+    /// copying the tool performs itself, which is the I/O-heavy part of a folder or IIS deploy.
+    ///
+    /// Windows applies background mode to the calling process only, so it does not reach the
+    /// build. Expect a noticeably slower deploy in exchange for a quieter disk. Default: false.
+    /// </summary>
+    [JsonPropertyName("backgroundIo")]
+    public bool BackgroundIo { get; set; } = false;
+
+    /// <summary>
+    /// Cores MSBuild may build across, passed as -maxcpucount. Default 1, which is the single
+    /// most effective setting here: priority only helps once cores are contended, whereas a
+    /// low core count leaves cores free in the first place. 0 means "no limit" (MSBuild's own
+    /// default of one node per core).
+    /// </summary>
+    [JsonPropertyName("maxCpuCount")]
+    public int MaxCpuCount { get; set; } = 1;
+
+    /// <summary>
+    /// Stops builds using MSBuild node reuse, the MSBuild Server and the Roslyn shared
+    /// compiler. Those are daemons that outlive the build that spawned them, so a later build
+    /// attaching to one runs at whatever priority that earlier build had - which defeats every
+    /// other setting in this block. Leave true unless build time matters more than restraint.
+    /// </summary>
+    [JsonPropertyName("disableBuildServers")]
+    public bool DisableBuildServers { get; set; } = true;
+
+    /// <summary>
+    /// Forces workstation GC on spawned .NET processes. Server GC allocates a heap and a
+    /// dedicated thread per core, which is a real cost on a many-core production host.
+    /// Default: true.
+    /// </summary>
+    [JsonPropertyName("workstationGc")]
+    public bool WorkstationGc { get; set; } = true;
+}
+
+/// <summary>Scheduling priority, mapped to ProcessPriorityClass (a nice value on Unix).</summary>
+public enum ProcessPriority { Normal, BelowNormal, Idle }
 
 // -----------------------------------------------------------------------------
 // Servers / Rollout

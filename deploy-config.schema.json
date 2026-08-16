@@ -39,6 +39,17 @@
         }
       ]
     },
+    "resources": {
+      "description": "How hard the deploy pipeline should work to stay out of the way of the applications\nalready running on this box. Omit the block to accept the defaults, which are already\nconservative: below-normal priority, one build core, no build server processes.",
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/definitions/ResourceConfig"
+        }
+      ]
+    },
     "doNotPublishIfNoPubInCommitMessage": {
       "type": "boolean",
       "description": "When true, a commit with no pub: directive deploys nothing - publishing becomes\nopt-in per commit. Use pub:* to deploy everything, pub:none to deploy nothing.\n            \nThe --force-all flag still overrides this: it is an explicit manual action, and a\nbutton that silently did nothing would be worse than the safety it bought.\nDefault: false - changed-file resolution behaves as it always has."
@@ -89,6 +100,52 @@
           "format": "int32"
         }
       }
+    },
+    "ResourceConfig": {
+      "type": "object",
+      "description": "Caps on what a deploy is allowed to take from the box it runs on. Applied by\nResourceGovernor at startup; priority and environment both inherit, so these settings\nreach every process the deploy spawns, not just the ones this tool launches directly.",
+      "additionalProperties": false,
+      "properties": {
+        "priority": {
+          "description": "Scheduling priority for the deploy and everything it spawns.\n\u0022BelowNormal\u0022 (default) yields to live applications while still making steady progress.\n\u0022Idle\u0022 runs only on otherwise-spare cycles - safest for a busy production box, but a\ndeploy can take substantially longer. \u0022Normal\u0022 opts out entirely.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/ProcessPriority"
+            }
+          ]
+        },
+        "backgroundIo": {
+          "type": "boolean",
+          "description": "Windows only. Puts the deploy process into background mode, which lowers I/O and memory\npriority as well as CPU - a priority class covers CPU alone. This governs the file\ncopying the tool performs itself, which is the I/O-heavy part of a folder or IIS deploy.\n            \nWindows applies background mode to the calling process only, so it does not reach the\nbuild. Expect a noticeably slower deploy in exchange for a quieter disk. Default: false."
+        },
+        "maxCpuCount": {
+          "type": "integer",
+          "description": "Cores MSBuild may build across, passed as -maxcpucount. Default 1, which is the single\nmost effective setting here: priority only helps once cores are contended, whereas a\nlow core count leaves cores free in the first place. 0 means \u0022no limit\u0022 (MSBuild\u0027s own\ndefault of one node per core).",
+          "format": "int32"
+        },
+        "disableBuildServers": {
+          "type": "boolean",
+          "description": "Stops builds using MSBuild node reuse, the MSBuild Server and the Roslyn shared\ncompiler. Those are daemons that outlive the build that spawned them, so a later build\nattaching to one runs at whatever priority that earlier build had - which defeats every\nother setting in this block. Leave true unless build time matters more than restraint."
+        },
+        "workstationGc": {
+          "type": "boolean",
+          "description": "Forces workstation GC on spawned .NET processes. Server GC allocates a heap and a\ndedicated thread per core, which is a real cost on a many-core production host.\nDefault: true."
+        }
+      }
+    },
+    "ProcessPriority": {
+      "type": "string",
+      "description": "Scheduling priority, mapped to ProcessPriorityClass (a nice value on Unix).",
+      "x-enumNames": [
+        "Normal",
+        "BelowNormal",
+        "Idle"
+      ],
+      "enum": [
+        "Normal",
+        "BelowNormal",
+        "Idle"
+      ]
     },
     "ServerConfig": {
       "type": "object",
