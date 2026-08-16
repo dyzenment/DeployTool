@@ -35,6 +35,11 @@ on:
         required: false
         default: "false"
         type: boolean
+      skip_tests:
+        description: "Bypass the unit-test gate (same as a skiptests commit directive)"
+        required: false
+        default: "false"
+        type: boolean
 
   # Deploy on push to main. Comment this out if you only want manual deploys.
   push:
@@ -223,13 +228,25 @@ jobs:
           CHANGED_FILES: ${{ steps.changed_files.outputs.files }}
           # inputs.* is empty on push events; default to false there.
           FORCE_ALL: ${{ inputs.force_all || 'false' }}
+          # Left as false on a push, so the gate is bypassed only by a skiptests commit
+          # directive - which the tool reads from HEAD itself.
+          SKIP_TESTS: ${{ inputs.skip_tests || 'false' }}
           # Inject any secrets your deploy-config.json references via %VAR% expansion.
           # Example (Velopack -> Azure Blob):
           #   AZ_ACCOUNT: ${{ secrets.AZ_ACCOUNT }}
           #   AZ_KEY: ${{ secrets.AZ_KEY }}
           PLACEHOLDER: ""
         run: |
+          # --skip-tests is passed only when the dispatch input asked for it. Sending
+          # "--skip-tests false" on every run would be an explicit "run the tests", which
+          # overrides - and so silently discards - a skiptests directive in the commit message.
+          SKIP_ARG=()
+          if [ "$SKIP_TESTS" = "true" ]; then
+            SKIP_ARG=(--skip-tests true)
+          fi
+
           dotnet dytools-deploy \
             --config deploy-config.json \
             --changed "$CHANGED_FILES" \
-            --force-all "$FORCE_ALL"
+            --force-all "$FORCE_ALL" \
+            "${SKIP_ARG[@]}"

@@ -14,6 +14,8 @@ namespace Dytools.DeployTool.Resolvers;
 ///                   nothing. Deliberately not a special case.
 ///   wait:0          override the rollout soak delay, in seconds
 ///   wait:60         wait 60 seconds before peers receive the build
+///   skiptests       deploy without running the unit-test gate
+///   skiptests:false run the gate even if something else would have skipped it
 ///
 /// Pure and side-effect free: the git call happens in the caller so this stays trivially
 /// testable. CLI overrides are layered over the commit directives with <see cref="OverlaidWith"/>.
@@ -25,6 +27,13 @@ public sealed class CommitDirectives
 
     /// <summary>Seconds from a wait: directive. Null when the commit carries no wait:.</summary>
     public int? WaitSeconds { get; init; }
+
+    /// <summary>
+    /// Whether to bypass the unit-test gate. Null when nothing said either way, which is what
+    /// lets a command-line --skip-tests false countermand a skiptests in the commit message:
+    /// "unspecified" and "explicitly off" have to be distinguishable for the overlay to work.
+    /// </summary>
+    public bool? SkipTests { get; init; }
 
     /// <summary>True when the commit explicitly stated what to publish.</summary>
     public bool HasPub => PubPatterns is not null;
@@ -38,12 +47,20 @@ public sealed class CommitDirectives
     private static readonly Regex WaitRegex =
         new(@"\bwait:(\d+)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    // Unlike pub:/wait: this one is meaningful bare, since "skip the tests" needs no argument.
+    // The optional :true/:false exists so a commit can say "no, definitely run them".
+    // skiptests, skip-tests and skip_tests are all accepted - the separator is not worth a
+    // failed deploy, and a directive nobody can misspell is a directive people will use.
+    private static readonly Regex SkipTestsRegex =
+        new(@"\bskip[-_]?tests(?::(true|false))?\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     public static CommitDirectives Parse(string? commitMessage)
     {
         if (string.IsNullOrWhiteSpace(commitMessage)) return None;
 
         var pubMatch  = PubRegex.Match(commitMessage);
         var waitMatch = WaitRegex.Match(commitMessage);
+        var skipMatch = SkipTestsRegex.Match(commitMessage);
 
         var patterns = pubMatch.Success ? SplitPubPatterns(pubMatch.Groups[1].Value) : null;
 
@@ -51,7 +68,20 @@ public sealed class CommitDirectives
         if (waitMatch.Success && int.TryParse(waitMatch.Groups[1].Value, out var parsed))
             waitSeconds = parsed;
 
-        return new CommitDirectives { PubPatterns = patterns, WaitSeconds = waitSeconds };
+        bool? skipTests = null;
+        if (skipMatch.Success)
+        {
+            // Bare "skiptests" means skip; "skiptests:false" is the explicit opt-out.
+            var value = skipMatch.Groups[1].Value;
+            skipTests = value.Length == 0 || bool.Parse(value);
+        }
+
+        return new CommitDirectives
+        {
+            PubPatterns = patterns,
+            WaitSeconds = waitSeconds,
+            SkipTests   = skipTests
+        };
     }
 
     /// <summary>
@@ -60,11 +90,12 @@ public sealed class CommitDirectives
     /// so it overlays cleanly. <paramref name="pubRaw"/> uses the same pipe-separated glob
     /// syntax as pub: ("Web|Proc*", "*", "none").
     /// </summary>
-    public static CommitDirectives FromValues(string? pubRaw, int? waitSeconds)
+    public static CommitDirectives FromValues(string? pubRaw, int? waitSeconds, bool? skipTests = null)
         => new()
         {
             PubPatterns = pubRaw is null ? null : SplitPubPatterns(pubRaw),
-            WaitSeconds = waitSeconds
+            WaitSeconds = waitSeconds,
+            SkipTests   = skipTests
         };
 
     /// <summary>
@@ -77,7 +108,8 @@ public sealed class CommitDirectives
         => new()
         {
             PubPatterns = overrides.PubPatterns ?? PubPatterns,
-            WaitSeconds = overrides.WaitSeconds ?? WaitSeconds
+            WaitSeconds = overrides.WaitSeconds ?? WaitSeconds,
+            SkipTests   = overrides.SkipTests   ?? SkipTests
         };
 
     private static List<string> SplitPubPatterns(string raw)

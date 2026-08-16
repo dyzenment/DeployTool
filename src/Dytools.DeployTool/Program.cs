@@ -156,18 +156,21 @@ internal class Program
 
         var cliOverrides = CommitDirectives.FromValues(
             parsedArgs.GetOptional("pub"),
-            parsedArgs.GetOptionalInt("wait"));
+            parsedArgs.GetOptionalInt("wait"),
+            parsedArgs.GetOptionalBool("skip-tests"));
         var directives = commitDirectives.OverlaidWith(cliOverrides);
 
         var subject = commitMessage.Split('\n').FirstOrDefault()?.Trim();
         if (!string.IsNullOrWhiteSpace(subject))
             Console.WriteLine($"  Message: {subject}");
-        if (cliOverrides.HasPub || cliOverrides.WaitSeconds.HasValue)
+        if (cliOverrides.HasPub || cliOverrides.WaitSeconds.HasValue || cliOverrides.SkipTests.HasValue)
             Console.WriteLine("  (directives overridden from command line)");
         if (directives.HasPub)
             Console.WriteLine($"  Directive pub:  {string.Join(" | ", directives.PubPatterns!)}");
         if (directives.WaitSeconds.HasValue)
             Console.WriteLine($"  Directive wait: {directives.WaitSeconds.Value}s");
+        if (directives.SkipTests == true)
+            Console.WriteLine("  Directive skiptests: unit-test gate bypassed for this run");
 
         // -- Dependency resolution ---------------------------------------------
 
@@ -305,7 +308,7 @@ internal class Program
 
         // -- Unit tests --------------------------------------------------------
         Console.WriteLine("  -- Unit Tests -------------------------------------------");
-        if (!await RunTestsAsync(project, registry, result)) return result;
+        if (!await RunTestsAsync(project, registry, result, plan.SkipTests)) return result;
 
         // -- Targets -----------------------------------------------------------
         // Sourced from the plan, not re-derived from config: the plan already decided what
@@ -422,8 +425,19 @@ internal class Program
     private static async Task<bool> RunTestsAsync(
         DiscoveredProject project,
         ProjectRegistry registry,
-        ProjectDeployResult result)
+        ProjectDeployResult result,
+        bool skipTests)
     {
+        // Checked before runTests, and recorded rather than merely printed: an ungated deploy
+        // is exactly the thing someone reads result.json afterwards to find out about.
+        if (skipTests)
+        {
+            result.TestResults.Add(ProcessRunner.Synthetic(
+                "unit tests", "Skipped by skiptests directive / --skip-tests."));
+            Console.WriteLine("  [Tests] Skipped (skiptests directive).");
+            return true;
+        }
+
         if (project.Config is { RunTests: false })
         {
             Console.WriteLine("  [Tests] Skipped (runTests: false).");

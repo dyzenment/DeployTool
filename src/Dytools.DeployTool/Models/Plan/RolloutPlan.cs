@@ -24,6 +24,13 @@ public sealed class RolloutPlan
     /// </summary>
     public int WaitSeconds { get; init; }
 
+    /// <summary>
+    /// True when the unit-test gate is bypassed for this run, from a skiptests directive or
+    /// --skip-tests. Decided here with everything else rather than re-read at test time, so the
+    /// plan remains the single record of what this run chose to do.
+    /// </summary>
+    public bool SkipTests { get; init; }
+
     public PlanSelection Selection { get; init; } = new();
 
     /// <summary>

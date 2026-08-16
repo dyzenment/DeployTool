@@ -39,6 +39,7 @@ public static class Planner
             RunId       = runId,
             CommitSha   = commitSha,
             WaitSeconds = directives.WaitSeconds ?? config.Rollout?.DelaySeconds ?? 3600,
+            SkipTests   = directives.SkipTests ?? false,
             Selection   = new PlanSelection
             {
                 Projects = selectedProjects.Select(p => p.Name).ToList(),

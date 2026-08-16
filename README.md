@@ -128,12 +128,13 @@ dytools-deploy --config deploy-config.json --changed "src/App/Foo.cs|src/Lib/Bar
 | `--force-all <true\|false>` | Deploy every enabled project regardless of changed files. |
 | `--pub "<patterns>"` | Override the commit's `pub:` - pipe-separated name globs (`"Web\|Proc*"`, `"*"`, `"none"`). Selects projects by name regardless of `--changed`. |
 | `--wait <seconds>` | Override the commit's `wait:` rollout soak delay. `0` = peers apply immediately. |
+| `--skip-tests [true\|false]` | Bypass the unit-test gate. Usable bare (`--skip-tests`). Overrides the commit's `skiptests`; pass `false` to force the gate on for a commit that asked to skip it. |
 
 The tool exits `0` on success, `1` on failure. Which projects deploy is decided from the
 changed-file list against each project's folder, its `.csproj` `ProjectReference`s (resolved
-automatically), and any extra `dependentProjects` triggers. Directives `pub:<pattern>` and
-`wait:<seconds>` are read from the `HEAD` commit; `--pub` / `--wait` override them field by field
-(see [Running it by hand](#running-it-by-hand)).
+automatically), and any extra `dependentProjects` triggers. Directives `pub:<pattern>`,
+`wait:<seconds>` and `skiptests` are read from the `HEAD` commit; `--pub` / `--wait` /
+`--skip-tests` override them field by field (see [Running it by hand](#running-it-by-hand)).
 
 ## Minimal config
 
@@ -346,10 +347,25 @@ Upload targets also honor `keepMaxReleases` (int) to prune old releases. Credent
 
 ### Directives (recap)
 
-`pub:` and `wait:` in the `HEAD` commit message steer a run, and `--pub` / `--wait` override them
-on the command line - see the [command-line reference](#command-line-reference).
-`doNotPublishIfNoPubInCommitMessage` above turns `pub:`
-into a required opt-in.
+Directives in the `HEAD` commit message steer a run, and the matching command-line flags override
+them field by field - see the [command-line reference](#command-line-reference).
+
+| Directive | Effect | CLI override |
+|-----------|--------|--------------|
+| `pub:Web\|Proc*` | Publish exactly these projects (pipe-separated name globs). `pub:*` publishes everything, `pub:none` nothing. | `--pub` |
+| `wait:<seconds>` | Rollout soak delay before peers apply. | `--wait` |
+| `skiptests` | Deploy without running the unit-test gate. Also spelled `skip-tests` / `skip_tests`, and `skiptests:false` forces the gate back on. | `--skip-tests` |
+
+```
+git commit -m "urgent hotfix pub:WebApp wait:0 skiptests"
+```
+
+Because a flag that was never passed must not countermand the commit, `--skip-tests` is
+three-state: absent leaves the commit's decision alone, `--skip-tests` skips, and
+`--skip-tests false` runs the gate even when the commit asked to skip it. A skipped gate is
+recorded in `result.json`, not just printed.
+
+`doNotPublishIfNoPubInCommitMessage` above turns `pub:` into a required opt-in.
 
 ## Architecture
 
