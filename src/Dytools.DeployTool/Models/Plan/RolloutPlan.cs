@@ -94,6 +94,18 @@ public sealed class ServerPlan
     public string? IncomingShare { get; init; }
 
     /// <summary>
+    /// Credentials for reaching <see cref="IncomingShare"/>, when the primary's own identity is
+    /// not enough. Null for self, and for any peer on a shared identity.
+    ///
+    /// A ServerPlan never leaves the primary's memory - only ApplyStep travels, inside a
+    /// manifest that sits on a file share. Keep it that way: nothing here may be serialized.
+    /// </summary>
+    public string? ShareUsername { get; init; }
+
+    /// <inheritdoc cref="ShareUsername"/>
+    public string? SharePassword { get; init; }
+
+    /// <summary>
     /// Self receives every step. A peer receives only Server-scoped steps - Global steps
     /// (velopack uploads to Azure) are emitted once, here, and never travel.
     /// </summary>

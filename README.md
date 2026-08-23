@@ -259,6 +259,8 @@ for that run (matched by `hostname`), and every other listed server is a peer.
 | `name` | string | `""` | Short label used in logs, manifests, and reports. |
 | `hostname` | string | `""` | Matched against the running box's name to decide which entry it is. See [Which server am I?](#which-server-am-i). |
 | `incomingShare` | string | `null` | UNC path where the primary drops run folders for this peer, e.g. `\\WEB02\deploy\incoming`. Unused on whichever box is currently the primary (it applies inline). |
+| `username` | string | `null` | Account the primary authenticates to this peer's share with. Leave unset on a domain, or with mirrored local accounts. See [Reaching a peer's share](#reaching-a-peers-share). |
+| `password` | string | `null` | Password for `username`. Write it as `"%DEPLOY_SHARE_PASSWORD%"` - never a literal. |
 
 `incomingShare` must be a **subfolder of a share, not the share root**: the primary copies into a
 `staging` folder beside it (`\\WEB02\deploy\staging\<runId>`) and then *moves* the finished
@@ -357,6 +359,124 @@ The peer needs the .NET runtime installed - it does not need the SDK, a checkout
 
 On Linux or macOS `install-agent` creates the same layout and a `poll.sh`, then prints the crontab
 line for you to add - it will not edit a server's crontab behind your back.
+
+### Reaching a peer's share
+
+`install-agent` prints all of this for the box you run it on, with the real names filled in.
+Summarised here for reference.
+
+**Share the root, not `incoming`.** The primary copies into `staging\<runId>` and then *moves* it
+into `incoming\<runId>` - the move is what makes the handoff atomic - and prunes old runs
+afterwards. It needs write and delete on both folders:
+
+```bat
+net share deploy=C:\deploy /grant:deploysvc,CHANGE
+icacls C:\deploy /grant deploysvc:(OI)(CI)M
+```
+
+Both commands matter: the SMB share permission and the NTFS permission are separate gates and the
+stricter one wins.
+
+**Then give the primary an identity the peer accepts.** On a domain, grant the runner's account and
+you are done. In a **workgroup there is no shared identity**, and a self-hosted Actions runner
+installs as a service running as `NETWORK SERVICE` - which authenticates over the network as the
+*machine account* (`WEB01$`), a name a peer with no domain controller cannot resolve. Granting it
+on the share will not help. Two ways out:
+
+| | Option A - credentials in config | Option B - mirrored local account |
+|---|---|---|
+| Peer | create `deploysvc`, grant it the share | create `deploysvc`, grant it the share |
+| Primary | nothing | create the **same** username and password, repoint the runner service at it |
+| Config | `username` + `password` | nothing |
+| Cost | a secret to manage | reconfiguring the runner, and two passwords to keep in step forever |
+
+#### Option A - credentials in config
+
+On the **peer only**, elevated:
+
+```bat
+net user deploysvc "<strong-password>" /add
+wmic useraccount where "name='deploysvc'" set PasswordExpires=false
+net share deploy=C:\deploy /grant:deploysvc,CHANGE
+icacls C:\deploy /grant deploysvc:(OI)(CI)M
+```
+
+The account needs nothing beyond the share - it never logs on interactively, so it does not
+need to be an administrator and should not be one. Then in `deploy-config.json`:
+
+```jsonc
+{
+  "name": "web02",
+  "hostname": "EC2AMAZ-FFQRJ6U",
+  "incomingShare": "\\\\10.0.1.20\\deploy\\incoming",
+  "username": "EC2AMAZ-FFQRJ6U\\deploysvc",
+  "password": "%DEPLOY_SHARE_PASSWORD%"
+}
+```
+
+Nothing changes on the primary.
+
+#### Option B - mirrored local account
+
+Create the **same username with the same password** on both boxes:
+
+```bat
+net user deploysvc "<strong-password>" /add
+wmic useraccount where "name='deploysvc'" set PasswordExpires=false
+```
+
+Grant it the share on the peer (the `net share` / `icacls` pair above), then on the primary
+point the runner service at it: **Services → `actions.runner.*` → Log On → `.\deploysvc`**, and
+restart. The Log On tab grants "Log on as a service" for you. Nothing goes in the config -
+workgroup pass-through does the rest: the peer validates the incoming credentials against its
+own SAM and lets it in.
+
+#### How the password actually reaches the tool
+
+Ordinary environment inheritance - there is no secret store and nothing is written to disk:
+
+```yaml
+      - name: Deploy
+        env:
+          DEPLOY_SHARE_PASSWORD: ${{ secrets.DEPLOY_SHARE_PASSWORD }}
+        run: |
+          dotnet dytools-deploy --config deploy-config.json --changed "$CHANGED_FILES"
+```
+
+Actions sets that variable on the step's shell, `dytools-deploy` is a child process and inherits
+it, and `%DEPLOY_SHARE_PASSWORD%` in the config is expanded against the process environment at the
+moment the connection is opened. The same `%VAR%` mechanism every other secret in the config uses -
+`AZ_KEY` and friends - and it works identically on Windows and Linux runners.
+
+Two consequences worth knowing. Actions masks the secret in job logs, so even an accidental echo
+comes out as `***`. And because child processes inherit the environment, the variable is also
+visible to the build and IIS commands the tool spawns - unavoidable with env-var passing, and the
+reason this account should be scoped to the share and nothing else.
+
+The tool opens a deviceless session to the share for the length of the handoff and drops it after -
+no drive letters, nothing left mapped. A bare username is qualified with the peer's name
+automatically, *except* when the share is addressed by IP, where a bare name is what Windows
+accepts. The password is never logged, never written to `result.json`, and never reaches a
+manifest; `result.json` records only which username connected.
+
+A literal password warns on every run, and an environment reference that resolves to nothing is a
+hard error rather than a mystifying logon failure.
+
+> Credentials are a Windows facility. A Linux primary ignores them with a warning - mount the share
+> with its credentials before running the deploy.
+
+**Two things that bite on cloud VMs.** TCP 445 must be open from the primary (a security-group or
+NSG rule, not just the Windows firewall); and a Windows computer name only resolves by broadcast
+within one subnet, so across VPC subnets put the **private IP** in `incomingShare`. `hostname` still
+stays the computer name - it is how the peer recognises itself locally, and the two fields are
+independent.
+
+Verify **as the runner's account**, not your own login - that is the mistake that makes this look
+fixed when it is not:
+
+```bat
+psexec -u .\deploysvc -p "<password>" cmd /c "dir \\10.0.1.20\deploy\incoming"
+```
 
 ### Pack cache
 

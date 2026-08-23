@@ -232,6 +232,13 @@ jobs:
           # directive - which the tool reads from HEAD itself.
           SKIP_TESTS: ${{ inputs.skip_tests || 'false' }}
           # Inject any secrets your deploy-config.json references via %VAR% expansion.
+          #
+          # Uncomment if a servers[] entry sets "password": "%DEPLOY_SHARE_PASSWORD%" - needed
+          # when the peers are in a workgroup, where the runner service (NETWORK SERVICE)
+          # authenticates as a machine account no peer can resolve. See the README,
+          # "Reaching a peer's share".
+          #   DEPLOY_SHARE_PASSWORD: ${{ secrets.DEPLOY_SHARE_PASSWORD }}
+          #
           # Example (Velopack -> Azure Blob):
           #   AZ_ACCOUNT: ${{ secrets.AZ_ACCOUNT }}
           #   AZ_KEY: ${{ secrets.AZ_KEY }}

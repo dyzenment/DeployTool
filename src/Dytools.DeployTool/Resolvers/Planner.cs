@@ -141,6 +141,8 @@ public static class Planner
                 ServerName    = server.Name,
                 IsSelf        = isSelf,
                 IncomingShare = isSelf ? null : server.IncomingShare,
+                ShareUsername = isSelf ? null : server.Username,
+                SharePassword = isSelf ? null : server.Password,
                 // Self runs everything. A peer gets Server-scoped steps only - Global steps
                 // are emitted once, on the primary, and never travel.
                 Steps         = isSelf ? allSteps : peerSteps

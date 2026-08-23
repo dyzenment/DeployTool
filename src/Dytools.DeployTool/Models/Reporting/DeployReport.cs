@@ -65,6 +65,13 @@ public sealed class PropagationResult
     /// <summary>Earliest time the peer may apply, as stamped into its manifest.</summary>
     public DateTimeOffset NotBeforeUtc { get; init; }
 
+    /// <summary>
+    /// Account the share was opened as, or null when the primary connected as itself. Recorded
+    /// because "which identity wrote this" is the first question asked when a peer's folder has
+    /// the wrong permissions on it. The username only - never the password.
+    /// </summary>
+    public string? ConnectedAs { get; set; }
+
     public bool Success { get; set; }
     public string? ErrorMessage { get; set; }
 

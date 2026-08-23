@@ -131,6 +131,17 @@ public static class Propagator
                 "there is nowhere to stage beside it. Point it at a subfolder of the share " +
                 "(\"\\\\\\\\WEB02\\\\deploy\\\\incoming\"), not the share root.");
 
+        // Authenticate before touching anything. In a workgroup the primary has no identity the
+        // peer recognises, so without this every path below fails with access denied. A null
+        // means no credentials were configured, which is the domain / mirrored-account case.
+        using var share = NetworkShare.Connect(incoming, peer.ShareUsername, peer.SharePassword);
+
+        if (share is not null)
+        {
+            result.ConnectedAs = share.Username;
+            Console.WriteLine($"    Connected to {share.Root} as {share.Username}");
+        }
+
         var peerStaging = Path.Combine(deployRoot, StagingFolderName, plan.RunId);
         var peerRun     = Path.Combine(incoming, plan.RunId);
 

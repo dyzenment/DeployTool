@@ -165,6 +165,20 @@
             "string"
           ],
           "description": "Where the primary drops run folders for this peer, e.g. \u0022\\\\WEBSERVER02\\deploy\\incoming\u0022.\nUnused for whichever server is currently the primary (it applies inline from staging)."
+        },
+        "username": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Account the primary authenticates to this peer\u0027s share with. Leave null to connect as\nwhoever the deploy is already running as - correct on a domain, or when the same local\naccount exists with the same password on both boxes.\n            \nSet it when neither is true, which is the usual workgroup case: a self-hosted runner\nservice runs as NETWORK SERVICE and therefore authenticates as the machine account, a\nname a peer with no domain controller cannot resolve.\n            \nMust name a LOCAL account on the peer. Write it as \u0022PEERNAME\\user\u0022; a bare name is\nqualified with the peer\u0027s name automatically, except when the share is addressed by IP,\nwhere a bare name is what works."
+        },
+        "password": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Password for Username. Write it as \u0022%DEPLOY_SHARE_PASSWORD%\u0022 and set the\nvariable from a CI secret - this file lives in your repository. A literal value is\naccepted but warned about on every run, and an environment reference that resolves to\nnothing is an error rather than a mystifying logon failure."
         }
       }
     },

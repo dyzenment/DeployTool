@@ -553,6 +553,31 @@ Runs on the primary, **only after its own apply succeeds**.
 3. Prune peer run folders beyond `rollout.keepRuns`.
 4. Exit. **The runner is not held for the soak window.**
 
+### Authenticating to the peer
+
+A domain fleet needs nothing here: grant the runner's account and every path below works.
+
+A **workgroup** fleet does, and it is not obvious. A self-hosted Actions runner installs as a
+service running as `NETWORK SERVICE`, which over the network authenticates as the *machine
+account* (`WEB01$`). With no domain controller the peer cannot resolve that name, so every copy
+fails with access denied no matter what the share grants.
+
+The standing answer is mirrored local accounts - same username and password on both boxes, runner
+service repointed at it. That works, but it costs a runner reconfiguration and two passwords kept
+in step forever, and it is imposed on someone whose only goal was to add a second server.
+
+So `servers[]` also takes `username` / `password`, and `NetworkShare` opens a deviceless
+`WNetAddConnection2` session for the length of one handoff. Deviceless because a drive letter is
+shared process-wide state that concurrent peer deliveries would fight over. `ERROR_SESSION_CREDENTIAL_CONFLICT`
+is retried once after dropping the conflicting session - Windows permits one credential set per
+server per logon session, and an earlier peer in the same run is a realistic source of one.
+
+The password is taken as its raw config form so the resolver can distinguish an `%ENV%` reference
+from a literal someone is about to commit: a literal warns on every run, and a reference that
+resolves to nothing is a hard error rather than an unexplained logon failure. It is never logged,
+never serialized into `result.json` (which records the username only), and cannot reach a manifest -
+`ServerPlan` carries it, and `ServerPlan` never leaves the primary's memory.
+
 **Atomic handoff.** A move within the same share is atomic on NTFS, so the poller can never
 observe a half-copied run folder. This is why the primary stages first rather than copying
 straight into `incoming` (manifest-written-last is the weaker fallback).

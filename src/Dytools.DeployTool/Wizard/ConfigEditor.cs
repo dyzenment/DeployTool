@@ -695,6 +695,8 @@ internal static class ConfigEditor
             Console.WriteLine($"  N - Name             : {s.Name}");
             Console.WriteLine($"  H - Hostname         : {s.Hostname}");
             Console.WriteLine($"  I - Incoming share   : {Show(s.IncomingShare)}");
+            Console.WriteLine($"  U - Share username   : {Show(s.Username)}");
+            Console.WriteLine($"  P - Share password   : {Mask(s.Password)}");
             Console.WriteLine("  B - Back");
 
             switch (Key("Edit item"))
@@ -702,6 +704,16 @@ internal static class ConfigEditor
                 case "n": s.Name = Prompt.Ask("Name", s.Name); break;
                 case "h": s.Hostname = Prompt.Ask("Hostname", s.Hostname); break;
                 case "i": s.IncomingShare = Prompt.EditOptional("Incoming share", s.IncomingShare); break;
+                case "u":
+                    Console.WriteLine("  Local account ON THE PEER, e.g. WEB02\\deploysvc. Blank = connect as");
+                    Console.WriteLine("  whoever the deploy already runs as (domain, or mirrored local accounts).");
+                    s.Username = Prompt.EditOptional("Share username", s.Username);
+                    break;
+                case "p":
+                    Console.WriteLine("  Use an environment reference, not the password itself - this file is");
+                    Console.WriteLine("  in your repository. For example: %DEPLOY_SHARE_PASSWORD%");
+                    s.Password = Prompt.EditOptional("Share password", s.Password);
+                    break;
                 case "b": return;
             }
         }
@@ -711,6 +723,20 @@ internal static class ConfigEditor
     /// The entry this box is, or null. Ambiguity is not the wizard's problem to solve - it will
     /// stop a real deploy, and showing no marker is a truthful way to render it here.
     /// </summary>
+    /// <summary>
+    /// Renders a configured password without printing it. An environment reference is shown
+    /// as written - that is the whole point of using one, and seeing which variable is wired
+    /// up is exactly what someone is here to check.
+    /// </summary>
+    private static string Mask(string? password)
+    {
+        if (string.IsNullOrWhiteSpace(password)) return "(none)";
+
+        return password.Contains('%') || password.Contains('$')
+            ? password
+            : "******  (literal - use %ENV_VAR% instead)";
+    }
+
     private static ServerConfig? FindSelf(DeployConfig cfg)
     {
         try { return HostIdentity.Find(cfg.Servers, HostIdentity.Resolve())?.Server; }

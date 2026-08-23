@@ -164,6 +164,31 @@ public sealed class ServerConfig
     /// </summary>
     [JsonPropertyName("incomingShare")]
     public string? IncomingShare { get; set; }
+
+    /// <summary>
+    /// Account the primary authenticates to this peer's share with. Leave null to connect as
+    /// whoever the deploy is already running as - correct on a domain, or when the same local
+    /// account exists with the same password on both boxes.
+    ///
+    /// Set it when neither is true, which is the usual workgroup case: a self-hosted runner
+    /// service runs as NETWORK SERVICE and therefore authenticates as the machine account, a
+    /// name a peer with no domain controller cannot resolve.
+    ///
+    /// Must name a LOCAL account on the peer. Write it as "PEERNAME\user"; a bare name is
+    /// qualified with the peer's name automatically, except when the share is addressed by IP,
+    /// where a bare name is what works.
+    /// </summary>
+    [JsonPropertyName("username")]
+    public string? Username { get; set; }
+
+    /// <summary>
+    /// Password for <see cref="Username"/>. Write it as "%DEPLOY_SHARE_PASSWORD%" and set the
+    /// variable from a CI secret - this file lives in your repository. A literal value is
+    /// accepted but warned about on every run, and an environment reference that resolves to
+    /// nothing is an error rather than a mystifying logon failure.
+    /// </summary>
+    [JsonPropertyName("password")]
+    public string? Password { get; set; }
 }
 
 public sealed class RolloutConfig
