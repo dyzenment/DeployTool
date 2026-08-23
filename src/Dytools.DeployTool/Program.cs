@@ -20,12 +20,29 @@ internal class Program
         // background I/O - is applied once deploy-config.json has been read, below.
         ResourceGovernor.ApplyDefaultPriority();
 
-        // `init` (alias --makeconfig) scaffolds/edits a deploy-config.json; `edit <file>` opens an
-        // existing one. Checked before the --config requirement below so they run in a fresh repo.
-        if (args.Length > 0 && args[0] is "init" or "--init" or "--makeconfig")
-            return ConfigWizard.RunInit(args[1..]);
-        if (args.Length > 0 && args[0] == "edit")
-            return ConfigWizard.RunEdit(args[1..]);
+        // Subcommands are checked before the --config requirement below, so every one of them
+        // works in a fresh repo - and, more to the point, on a peer, which has no repo and no
+        // deploy-config.json at all. Leading dashes are tolerated on all of them because the
+        // agent's poll script is frozen around `--apply`.
+        switch (args.Length > 0 ? args[0].TrimStart('-').ToLowerInvariant() : string.Empty)
+        {
+            // Scaffold or edit a deploy-config.json.
+            case "init" or "makeconfig": return ConfigWizard.RunInit(args[1..]);
+            case "edit":                 return ConfigWizard.RunEdit(args[1..]);
+
+            // The peer half of a rollout: apply whatever is due in an incoming folder.
+            case "apply":                return await RunApplyAsync(args);
+
+            // Stand a peer up (or take it back down).
+            case "install-agent":        return await AgentInstaller.InstallAsync(ReadAgentOptions(args));
+            case "uninstall-agent":      return await AgentInstaller.UninstallAsync(ReadAgentOptions(args));
+
+            // Which servers[] entry is this box? Answers it without running a deploy.
+            case "hostname" or "whoami": return await RunHostnameAsync(args);
+
+            case "help" or "h" or "?":   PrintUsage(); return 0;
+            case "":                     PrintUsage(); return 1;
+        }
 
         // Secrets referenced by deploy-config.json (via %VAR% placeholders) are read from
         // environment variables. Set them in your shell (or your CI job) before running:
@@ -133,7 +150,12 @@ internal class Program
         var commitSha  = GetCommitSha();
         var shortSha   = commitSha.Length >= 7 ? commitSha[..7] : commitSha;
         var runId      = $"{DateTimeOffset.Now:yyyyMMdd-HHmmss}-{shortSha}";
-        var serverName = Environment.MachineName;
+
+        // Which servers[] entry this box is. Defaults to the machine name and needs no
+        // configuration; --server or DEPLOYTOOL_SERVER pin it for boxes the fleet calls
+        // something other than what Windows does. See `dytools-deploy hostname`.
+        var serverOverride = parsedArgs.GetOptional("server");
+        var serverName     = HostIdentity.Resolve(serverOverride);
 
         var report = new DeployReport
         {
@@ -145,7 +167,7 @@ internal class Program
         };
         Console.WriteLine($"\n  Commit: {report.CommitSha}");
         Console.WriteLine($"  Run ID: {runId}");
-        Console.WriteLine($"  Server: {serverName}");
+        Console.WriteLine($"  Server: {serverName}  (from {HostIdentity.ResolveSource(serverOverride)})");
 
         // -- Directives --------------------------------------------------------
         // Base directives come from the HEAD commit message; --pub/--wait on the command
@@ -214,12 +236,7 @@ internal class Program
 
         // -- Handlers ----------------------------------------------------------
 
-        var handlers = new Dictionary<DeployType, IDeployTypeHandler>
-        {
-            [DeployType.Velopack] = new VelopackHandler(),
-            [DeployType.Iis]      = new IisHandler(),
-            [DeployType.Folder]   = new FolderHandler()
-        };
+        var handlers = BuildHandlers();
 
         // -- Plan --------------------------------------------------------------
         // The entire rollout -- every server, every step -- decided here in one shot from
@@ -257,6 +274,27 @@ internal class Program
                     project, plan, handlers, registry, stagingRoot);
                 report.Results.Add(projectResult);
             }
+
+            // -- Propagate to peers -------------------------------------------
+            // Only reached when this box's own apply succeeded. That ordering IS the
+            // failure policy: a broken build never gets written to a peer, so there is no
+            // separate guard to forget. The soak clock starts here, at proven-good, and
+            // travels in the manifest - the runner is not held for the window.
+
+            if (plan.HasPeers)
+            {
+                Console.WriteLine("\n-- Propagation -------------------------------------------------");
+
+                if (report.Success)
+                    report.Propagation.AddRange(Propagator.Propagate(
+                        plan, stagingRoot,
+                        deployConfig.Rollout?.KeepRuns ?? 5,
+                        DateTimeOffset.Now));
+                else
+                    Console.WriteLine(
+                        "  Primary failed -- no manifests written. " +
+                        $"{plan.ServerPlans.Count(s => !s.IsSelf)} peer(s) receive nothing.");
+            }
         }
         finally
         {
@@ -272,6 +310,214 @@ internal class Program
         ReportWriter.Write(report, stagingRoot);
         return report.Success ? 0 : 1;
     }
+
+    // -- Handlers --------------------------------------------------------------
+
+    /// <summary>
+    /// The one handler table. Shared by the primary's inline apply and a peer's apply mode,
+    /// because "identical executor on both sides" stops being true the moment there are two
+    /// places that decide what a deploy type means.
+    /// </summary>
+    private static Dictionary<DeployType, IDeployTypeHandler> BuildHandlers() => new()
+    {
+        [DeployType.Velopack] = new VelopackHandler(),
+        [DeployType.Iis]      = new IisHandler(),
+        [DeployType.Folder]   = new FolderHandler()
+    };
+
+    // -- apply -----------------------------------------------------------------
+
+    /// <summary>
+    /// Peer mode. Invoked by the agent's poll script every minute, forever, as
+    /// <c>DeployTool.exe --apply "C:\deploy\incoming"</c>.
+    ///
+    /// Takes no config: everything this box is meant to do arrived with the run. Bare
+    /// <c>apply</c> falls back to the standard layout so it can be run by hand on an
+    /// installed peer without repeating a path the installer already fixed.
+    /// </summary>
+    private static async Task<int> RunApplyAsync(string[] args)
+    {
+        var parsed = Args.Parse(args);
+
+        var incoming = Positional(args, 1)
+                    ?? parsed.GetOptional("apply")
+                    ?? new AgentLayout(parsed.GetOptional("root") ?? AgentInstaller.DefaultRoot).Incoming;
+
+        try
+        {
+            return await ApplyRunner.RunAsync(incoming, BuildHandlers());
+        }
+        catch (Exception ex)
+        {
+            // The poll script redirects to agent.log and nobody is watching the console, so an
+            // unhandled exception here would be an invisible failure repeating every minute.
+            Console.WriteLine($"\n  ✗ Apply aborted: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
+            return 1;
+        }
+    }
+
+    // -- install-agent / uninstall-agent ---------------------------------------
+
+    private static AgentOptions ReadAgentOptions(string[] args)
+    {
+        var parsed = Args.Parse(args);
+
+        return new AgentOptions
+        {
+            Root      = parsed.GetOptional("root")      ?? AgentInstaller.DefaultRoot,
+            TaskName  = parsed.GetOptional("task-name") ?? AgentInstaller.DefaultTaskName,
+            RunAsUser = parsed.GetOptional("user")      ?? "SYSTEM",
+            // A sub-minute interval is not expressible in Task Scheduler's repetition, and a
+            // zero would register a task that never fires.
+            IntervalMinutes = Math.Max(1,
+                parsed.GetOptionalInt("interval") ?? AgentInstaller.DefaultIntervalMinutes)
+        };
+    }
+
+    // -- hostname --------------------------------------------------------------
+
+    /// <summary>
+    /// Answers "which servers[] entry is this box, and why" without running a deploy.
+    ///
+    /// Worth its own command because the failure it prevents is silent: a box whose hostname
+    /// does not match anything in servers[] still deploys itself perfectly well - it just
+    /// never propagates to anyone, and nothing about a green run says so.
+    ///
+    /// Exits 1 when a config was given and nothing matched, so a fleet check can be scripted.
+    /// </summary>
+    private static async Task<int> RunHostnameAsync(string[] args)
+    {
+        var parsed         = Args.Parse(args);
+        var serverOverride = parsed.GetOptional("server");
+        var identity       = HostIdentity.Resolve(serverOverride);
+
+        Console.WriteLine();
+        Console.WriteLine("  Names this box is known by");
+        foreach (var (source, value) in HostIdentity.Describe())
+            Console.WriteLine($"    {source,-26} {value}");
+
+        Console.WriteLine();
+        Console.WriteLine($"  Identifying as: {identity}   (from {HostIdentity.ResolveSource(serverOverride)})");
+
+        var configPath = parsed.GetOptional("config") ?? Positional(args, 1);
+
+        if (configPath is null)
+        {
+            Console.WriteLine();
+            Console.WriteLine("  Pass --config <deploy-config.json> to check this against servers[].");
+            return 0;
+        }
+
+        if (!File.Exists(configPath))
+        {
+            Console.WriteLine($"\n  ✗ No such config file: {configPath}");
+            return 1;
+        }
+
+        var config = JsonSerializer.Deserialize<DeployConfig>(
+            await File.ReadAllTextAsync(configPath), JsonOptions.Default);
+
+        if (config is null)
+        {
+            Console.WriteLine($"\n  ✗ Could not parse {configPath}.");
+            return 1;
+        }
+
+        if (config.Servers.Count == 0)
+        {
+            Console.WriteLine($"\n  servers[] in {configPath} is empty - single-box mode, nothing to match.");
+            return 0;
+        }
+
+        HostMatch? match;
+        try
+        {
+            match = HostIdentity.Find(config.Servers, identity);
+        }
+        catch (DeployException ex)
+        {
+            Console.WriteLine($"\n  ✗ {ex.Message}");
+            return 1;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine($"  servers[] in {configPath}");
+        foreach (var server in config.Servers)
+        {
+            var isSelf = match is not null && ReferenceEquals(match.Server, server);
+            Console.WriteLine(
+                $"    {(isSelf ? "→" : " ")} {server.Name,-18} hostname \"{server.Hostname}\"" +
+                (isSelf ? $"   ← this box (matched by {match!.Reason})" : string.Empty));
+        }
+
+        Console.WriteLine();
+
+        if (match is null)
+        {
+            Console.WriteLine("  ✗ Nothing matches this box. A deploy run here would apply locally and");
+            Console.WriteLine("    propagate to nobody. Either add an entry:");
+            Console.WriteLine();
+            Console.WriteLine("      {");
+            Console.WriteLine($"        \"name\": \"{identity.ToLowerInvariant()}\",");
+            Console.WriteLine($"        \"hostname\": \"{identity}\",");
+            Console.WriteLine("        \"incomingShare\": null");
+            Console.WriteLine("      }");
+            Console.WriteLine();
+            Console.WriteLine($"    or point this box at an existing entry with {HostIdentity.EnvVariable}.");
+            return 1;
+        }
+
+        Console.WriteLine(
+            $"  ✓ A deploy run here is the primary for '{match.Server.Name}', propagating to " +
+            $"{config.Servers.Count - 1} peer(s).");
+        return 0;
+    }
+
+    // -- Usage -----------------------------------------------------------------
+
+    private static void PrintUsage()
+    {
+        Console.WriteLine("""
+
+          dytools-deploy - config-driven .NET deployment across one or more servers.
+
+          Deploy (the primary; this is what CI runs)
+            dytools-deploy --config <path> [options]
+              --changed "a|b|c"    Pipe-separated changed files. Decides what needs deploying.
+              --force-all true     Deploy everything, ignoring the changed-file diff.
+              --pub "Web|Proc*"    Override the commit's pub: directive.
+              --wait <seconds>     Override the rollout soak delay. 0 = peers apply immediately.
+              --skip-tests         Bypass the unit-test gate.
+              --server <name>      Pin which servers[] entry this box is.
+
+          Peer
+            dytools-deploy apply [incoming]     Apply whatever is due. Run by the agent every minute.
+            dytools-deploy install-agent        Create the layout, poll script and schedule.
+            dytools-deploy uninstall-agent      Remove the schedule (folders and history stay).
+              --root <path>        Agent root. Default C:\deploy (Windows), /var/lib/deploytool.
+              --interval <minutes> Poll interval. Default 1.
+              --task-name <name>   Scheduled task name. Default DeployAgent.
+              --user <account>     SYSTEM (default), LOCALSERVICE or NETWORKSERVICE.
+
+          Diagnostics
+            dytools-deploy hostname [--config <path>]   Which servers[] entry is this box?
+
+          Config
+            dytools-deploy init [path]          Scaffold a deploy-config.json.
+            dytools-deploy edit <path>          Edit an existing one.
+
+          """);
+    }
+
+    /// <summary>
+    /// A positional argument, or null when that slot holds a switch instead. Lets
+    /// `apply C:\deploy\incoming` and `--apply C:\deploy\incoming` mean the same thing.
+    /// </summary>
+    private static string? Positional(string[] args, int index)
+        => args.Length > index && !args[index].StartsWith("--", StringComparison.Ordinal)
+            ? args[index]
+            : null;
 
     // -- Plan output -----------------------------------------------------------
 

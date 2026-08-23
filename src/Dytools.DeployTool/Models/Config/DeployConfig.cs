@@ -511,7 +511,214 @@ public sealed class IisConfig
     /// </summary>
     [JsonPropertyName("warmupUrl")]
     public string? WarmupUrl { get; set; }
+
+    /// <summary>
+    /// Stop and start the IIS site as well as its app pool. Stopping the site closes its
+    /// bindings, so nothing can connect at all - a stopped pool alone still accepts the
+    /// connection and answers 503. Only meaningful in classic mode; blue-green never stops
+    /// anything, which is the point of it. Default: false.
+    /// </summary>
+    [JsonPropertyName("stopSite")]
+    public bool StopSite { get; set; } = false;
+
+    /// <summary>
+    /// Takes this instance out of rotation before the deploy and puts it back afterwards.
+    /// Omit the block entirely and nothing changes: no notification, no wait.
+    /// </summary>
+    [JsonPropertyName("loadBalancer")]
+    public LoadBalancerConfig? LoadBalancer { get; set; }
 }
+
+// -----------------------------------------------------------------------------
+// Load balancer drain / restore
+// -----------------------------------------------------------------------------
+
+/// <summary>
+/// Wraps the deploy in a drain phase and a restore phase, so a box behind a load balancer
+/// stops receiving traffic before its site goes down and only receives it again once the
+/// new build has warmed.
+///
+/// Scoped per target rather than per server on purpose: rotation state is keyed per app
+/// instance, so two sites on one box drain independently and deploying one does not pull
+/// the other out of rotation.
+/// </summary>
+public sealed class LoadBalancerConfig
+{
+    /// <summary>
+    /// Decides whether any of this applies to the current run. Omit it and the drain/restore
+    /// phases always run.
+    /// </summary>
+    [JsonPropertyName("precheck")]
+    public LoadBalancerPrecheck? Precheck { get; set; }
+
+    /// <summary>Runs before the app pool and site are stopped.</summary>
+    [JsonPropertyName("drain")]
+    public LoadBalancerPhase? Drain { get; set; }
+
+    /// <summary>
+    /// Runs after warmup succeeds. Skipped when the deploy failed and left a build that was
+    /// never verified live - see the restore policy on LoadBalancerGate.
+    /// </summary>
+    [JsonPropertyName("restore")]
+    public LoadBalancerPhase? Restore { get; set; }
+}
+
+/// <summary>
+/// Decides up front whether this instance is actually in rotation, so a box that is already
+/// out of it - stopped site, maintenance, a flag someone flipped by hand - deploys with the
+/// plain routine instead of trying to drain something that is already drained.
+///
+/// This is a real correctness fix, not just an optimisation: on an offline box the health
+/// endpoint is unreachable, so the drain notification would fail, and a failed drain aborts
+/// the deploy by design. Without the precheck an offline server could not be updated at all.
+///
+/// The test is positive - the load-balancer routine runs only when the instance answers with
+/// <see cref="LiveStatus"/>. Anything else, including a connection that is refused or times
+/// out, means "not in rotation" and the whole block is skipped. Polling for a few seconds
+/// rather than asking once keeps a momentary blip on a genuinely live box from being read as
+/// "offline", which would stop the site on live traffic.
+/// </summary>
+public sealed class LoadBalancerPrecheck
+{
+    /// <summary>
+    /// Health endpoint to consult. Point it at localhost: the question is whether THIS
+    /// instance is serving, which a load balancer VIP cannot answer.
+    /// </summary>
+    [JsonPropertyName("url")]
+    public string? Url { get; set; }
+
+    /// <summary>
+    /// Status that means "in rotation, drain me properly". Default: 200. Any other response -
+    /// or none at all - skips the drain and restore phases for this run.
+    /// </summary>
+    [JsonPropertyName("liveStatus")]
+    public int LiveStatus { get; set; } = 200;
+
+    /// <summary>
+    /// How long to keep asking before concluding the instance is not in rotation. Kept short
+    /// by default: this is dead time on every deploy of an offline box. Default: 10.
+    /// </summary>
+    [JsonPropertyName("timeoutSeconds")]
+    public int TimeoutSeconds { get; set; } = 10;
+
+    /// <summary>Gap between attempts. Default: 2.</summary>
+    [JsonPropertyName("intervalSeconds")]
+    public int IntervalSeconds { get; set; } = 2;
+}
+
+/// <summary>
+/// One half of the rotation change: tell something, optionally confirm it took, then wait.
+/// Every part is optional. A phase with only waitSeconds is just a pause; a phase with only
+/// a notify is fire-and-forget.
+/// </summary>
+public sealed class LoadBalancerPhase
+{
+    /// <summary>
+    /// The call that changes rotation state - typically an HTTP request to the endpoint that
+    /// flips this instance's health flag. Omit to only verify and/or wait.
+    /// </summary>
+    [JsonPropertyName("notify")]
+    public NotifyHook? Notify { get; set; }
+
+    /// <summary>
+    /// Polled until it answers with <see cref="ExpectStatus"/>. Verification is skipped
+    /// entirely unless both this and expectStatus are set - with nothing to check against,
+    /// the phase assumes the notify worked and moves on.
+    ///
+    /// Point this at localhost, not at the load balancer VIP: a VIP response proves some
+    /// node is healthy, not that this one is in or out of rotation.
+    /// </summary>
+    [JsonPropertyName("verifyUrl")]
+    public string? VerifyUrl { get; set; }
+
+    /// <summary>
+    /// HTTP status verifyUrl must return before the phase proceeds - typically 500 after a
+    /// drain and 200 after a restore. Null disables verification.
+    /// </summary>
+    [JsonPropertyName("expectStatus")]
+    public int? ExpectStatus { get; set; }
+
+    /// <summary>How long to keep polling verifyUrl before giving up. Default: 60.</summary>
+    [JsonPropertyName("verifyTimeoutSeconds")]
+    public int VerifyTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>Gap between verifyUrl polls. Default: 2.</summary>
+    [JsonPropertyName("verifyIntervalSeconds")]
+    public int VerifyIntervalSeconds { get; set; } = 2;
+
+    /// <summary>
+    /// Fixed pause after the notify (and any verification) completes.
+    ///
+    /// On a drain this has a floor: a health-probe based balancer only removes the node
+    /// after unhealthyThreshold x probeInterval, and requests already in flight still need
+    /// to finish. Set it below that sum and the site stops on live traffic, which is the
+    /// outage this whole block exists to avoid. Verification confirms the flag flipped; it
+    /// cannot confirm the balancer noticed, so the wait is doing real work either way.
+    /// </summary>
+    [JsonPropertyName("waitSeconds")]
+    public int WaitSeconds { get; set; } = 0;
+}
+
+/// <summary>
+/// A single side-effecting call. Which fields apply depends on <see cref="Type"/>:
+///   http    - url (required), method, headers, body, expectStatus
+///   file    - path (required), action
+///   command - executable (required), arguments
+///
+/// url, path, body, executable and arguments all support %ENV_VAR% expansion for credentials
+/// and the tokens {hostname}, {site} and {project}. Both are resolved on the box that runs
+/// the step, never at plan time, because a peer receives this config verbatim and its
+/// hostname and environment differ from the primary's.
+/// </summary>
+public sealed class NotifyHook
+{
+    [JsonPropertyName("type")]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public NotifyHookType Type { get; set; } = NotifyHookType.Http;
+
+    [JsonPropertyName("url")]
+    public string? Url { get; set; }
+
+    /// <summary>HTTP verb. Default: POST.</summary>
+    [JsonPropertyName("method")]
+    public string Method { get; set; } = "POST";
+
+    [JsonPropertyName("headers")]
+    public Dictionary<string, string>? Headers { get; set; }
+
+    [JsonPropertyName("body")]
+    public string? Body { get; set; }
+
+    /// <summary>
+    /// Status the call itself must return to count as successful. Null accepts any 2xx.
+    /// </summary>
+    [JsonPropertyName("expectStatus")]
+    public int? ExpectStatus { get; set; }
+
+    /// <summary>File to create or delete, for the "file" type.</summary>
+    [JsonPropertyName("path")]
+    public string? Path { get; set; }
+
+    /// <summary>Whether the "file" type creates or deletes <see cref="Path"/>. Default: create.</summary>
+    [JsonPropertyName("action")]
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public FileHookAction Action { get; set; } = FileHookAction.Create;
+
+    /// <summary>Program to run, for the "command" type.</summary>
+    [JsonPropertyName("executable")]
+    public string? Executable { get; set; }
+
+    [JsonPropertyName("arguments")]
+    public string? Arguments { get; set; }
+
+    /// <summary>Applies to http and command. Default: 30.</summary>
+    [JsonPropertyName("timeoutSeconds")]
+    public int TimeoutSeconds { get; set; } = 30;
+}
+
+public enum NotifyHookType { Http, File, Command }
+
+public enum FileHookAction { Create, Delete }
 
 // -----------------------------------------------------------------------------
 // Folder

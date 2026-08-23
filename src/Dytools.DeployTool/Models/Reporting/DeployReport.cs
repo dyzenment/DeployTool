@@ -14,7 +14,13 @@ public sealed class DeployReport
     public DateTimeOffset? CompletedAt { get; set; }
     public TimeSpan? Duration => CompletedAt.HasValue ? CompletedAt.Value - StartedAt : null;
 
-    public bool Success => Results.Count > 0 && Results.All(r => r.Success);
+    /// <summary>
+    /// Propagation counts: a build that went live here but never reached a peer is a failed
+    /// run, not a successful one. The list is empty on a single-box run, so All() holds.
+    /// </summary>
+    public bool Success => Results.Count > 0
+                        && Results.All(r => r.Success)
+                        && Propagation.All(p => p.Success);
 
     public int TotalProjectsSelected => Results.Count;
     public int SucceededProjects => Results.Count(r => r.Success);
@@ -26,6 +32,45 @@ public sealed class DeployReport
 
     public List<StepResult> PrerequisiteResults { get; init; } = [];
     public List<ProjectDeployResult> Results { get; init; } = [];
+
+    /// <summary>One entry per peer this run shipped to. Empty on a single-box run.</summary>
+    public List<PropagationResult> Propagation { get; init; } = [];
+}
+
+/// <summary>
+/// The outcome of handing one peer its run folder. Recorded on the primary, because the
+/// primary is the only box that knows whether the handoff happened at all - the peer's own
+/// result.json only ever covers what it did after receiving one.
+/// </summary>
+public sealed class PropagationResult
+{
+    /// <summary>The peer's servers[] name.</summary>
+    public string ServerName { get; init; } = string.Empty;
+
+    /// <summary>Configured incomingShare, as written (before %ENV% expansion).</summary>
+    public string IncomingShare { get; init; } = string.Empty;
+
+    /// <summary>Final resting path of the run folder on the peer, once the move succeeded.</summary>
+    public string? RunFolder { get; set; }
+
+    /// <summary>How many apply steps this peer was given. Global-scope steps never travel.</summary>
+    public int StepCount { get; init; }
+
+    /// <summary>
+    /// Whether this run's own binary was shipped alongside the manifest. False means the peer
+    /// has the payload but nothing to execute it with - see Propagator.TryShipTool.
+    /// </summary>
+    public bool ToolShipped { get; set; }
+
+    /// <summary>Earliest time the peer may apply, as stamped into its manifest.</summary>
+    public DateTimeOffset NotBeforeUtc { get; init; }
+
+    public bool Success { get; set; }
+    public string? ErrorMessage { get; set; }
+
+    public DateTimeOffset StartedAt { get; init; } = DateTimeOffset.Now;
+    public DateTimeOffset? CompletedAt { get; set; }
+    public TimeSpan? Duration => CompletedAt.HasValue ? CompletedAt.Value - StartedAt : null;
 }
 
 public sealed class ProjectDeployResult

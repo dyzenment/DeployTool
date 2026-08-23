@@ -1,6 +1,6 @@
 # DeployTool - Multi-Server, Blue-Green, and Commit Directives
 
-Design and rationale for the multi-server, blue-green, and commit-directive features. The single-box planning, blue-green, and commit-directive pieces are implemented; the peer-agent and propagation half described below is the target design.
+Design and rationale for the multi-server, blue-green, and commit-directive features. The single-box planning, blue-green, and commit-directive pieces are implemented, as is propagation (§9) - the primary now writes each peer's manifest, ships the artifacts and its own binary, and hands the run folder over atomically. The peer agent (§8) that picks those folders up and applies them is still the target design, so today a delivered run sits in `incoming` until something applies it.
 
 Covers four features:
 
@@ -476,14 +476,16 @@ where the exe lives; the tool needs no configuration to find its own payload.
 
 ```bat
 @echo off
-REM Newest run folder wins - its (freshest) binary processes all pending runs.
+REM Newest run folder wins - its (freshest) tool processes all pending runs.
 for /f "delims=" %%d in ('dir /b /ad /o-d "C:\deploy\incoming" 2^>nul') do (
-  if exist "C:\deploy\incoming\%%d\DeployTool.exe" (
-    "C:\deploy\incoming\%%d\DeployTool.exe" --apply "C:\deploy\incoming" >> "C:\deploy\agent\agent.log" 2>&1
+  if exist "C:\deploy\incoming\%%d\tool\apply.cmd" (
+    call "C:\deploy\incoming\%%d\tool\apply.cmd" --apply "C:\deploy\incoming" >> "C:\deploy\agent\agent.log" 2>&1
     exit /b
   )
 )
 ```
+
+(The real file adds a log roll at 5 MB - it runs every minute, forever.)
 
 Note what it deliberately does **not** do: parse `notBeforeUtc`. JSON in batch is misery, and
 the wait logic belongs where it can be tested. The batch just launches the tool; the tool scans
@@ -505,16 +507,28 @@ visible when you go looking.
 
 `IgnoreNew` removes any need for a lock file for task-vs-task overlap.
 
-### `--install-agent`
+### `install-agent`
 
 One-time per box: creates `C:\deploy\{agent,staging,incoming}`, writes `poll.cmd`, registers the
 scheduled task. Standing up a new server becomes:
 
-1. Run `DeployTool.exe --install-agent` once.
-2. Add the box to `servers[]`.
+1. Run `dytools-deploy install-agent` once, elevated.
+2. Add the box to `servers[]` - the installer prints the entry.
 
-Because the tool ships self-contained (§10), the peer needs **no .NET prerequisite** for this to
-work on a fresh box.
+Switches: `--root`, `--interval`, `--task-name`, `--user`. Idempotent: folders are created only if
+missing, the script is rewritten from the same template, and the task is registered with `/F`, so a
+second run upgrades a box without disturbing its run history.
+
+Registration goes through `/XML`, not the `/SC MINUTE` switches, for two settings the switch form
+cannot express: `MultipleInstancesPolicy=IgnoreNew` (a deploy outlasts the poll interval - this is
+what removes the need for a lock file) and `ExecutionTimeLimit=PT0S` (the switch form inherits a
+72-hour cap, and a task killed mid-mirror leaves neither the old build nor the new one).
+
+`--user` accepts only the passwordless service accounts. Anything else is printed as a `schtasks`
+command for a human to run: a deploy tool has no business collecting a credential, and there is no
+way to pass one to `schtasks` that does not put it on a command line.
+
+The peer needs the **.NET runtime** - not the SDK, not a checkout, not a config file (§10).
 
 ### `result.json` is the idempotency marker
 
@@ -556,6 +570,13 @@ so if the primary fails, no peer ever receives anything. There is no guard to fo
 record of what *would* have shipped.
 
 ### Round-trip the primary's own steps
+
+> **Not built.** The primary currently executes its `ApplyStep` objects in memory. The manifest it
+> writes for each peer is serialized from those same objects, so the format is exercised on every
+> fleet deploy - but a single-box run never touches it, and a serialization bug would surface on a
+> peer rather than on the primary. The rationale below still stands; it is a candidate, not a
+> description.
+
 
 The primary writes its own `manifest.json` to staging, **deserializes it back, and executes from
 that copy.**
@@ -625,7 +646,28 @@ workspace.
 
 **Cost:** self-contained single-file publish is ~30–60 s vs ~10 s for `dotnet build`, on every
 deploy, even with no peers. Next to the test suite this is noise - and it buys peers with zero
-.NET prerequisites, which is what makes `--install-agent` a genuine one-liner on a fresh box.
+.NET prerequisites, which is what makes `install-agent` a genuine one-liner on a fresh box.
+
+### What was actually built
+
+The tool ships as a `dotnet tool` (`PackAsTool`, `SelfContained=false`), so the paragraph above
+describes a road not taken. The consequences, all of them fine:
+
+- **A peer needs the .NET runtime.** Peers here are IIS boxes serving .NET applications, so they
+  have one. This is the only prerequisite the design gained.
+- **Propagation ships the payload directory, not a file.** An apphost is useless without its
+  managed dll, `deps.json` and `runtimeconfig.json` beside it - and a packed tool has no apphost
+  at all, only the dll. `Propagator.ShipTool` copies the whole directory (minus the XML doc file)
+  into `<run>\tool\`.
+- **The launcher is generated per run.** `apply.cmd` / `apply.sh` are written at propagation time
+  by the code that knows how this build starts, and both are written because a Linux runner
+  shipping to a Windows peer cannot know which the peer will use. `apply.cmd` falls back to
+  `%ProgramFiles%\dotnet\dotnet.exe` when `dotnet` is not on `SYSTEM`'s PATH - a real failure mode
+  after a runtime install without a reboot.
+- **`poll.cmd` stays frozen**, and now knows exactly one filename instead of a binary layout.
+
+Should the tool ever also publish self-contained, `ShipTool` already handles it: no managed
+`Location` means single-file, and the launcher execs the binary directly.
 
 ---
 
@@ -655,8 +697,12 @@ Each phase is independently shippable and leaves the tool working.
 | **1** | Blue-green IIS (`siteName`, `secondaryDeployPath`, `warmupUrl`) | Independent. Ships alone. Immediate win. |
 | **2** | `pub:` / `wait:` parsing + `doNotPublishIfNoPubInCommitMessage` | Small, independent, pure - easy to test. |
 | **3** | Planner → `RolloutPlan`; `result.json` writer                | Pure. Fully unit-testable.               |
-| **4** | Apply mode + manifest + `--install-agent` + `poll.cmd`       | The peer half.                           |
-| **5** | Propagation (copy self + artifacts, atomic move, pruning)    | Uses 3 & 4.                              |
+| **4** | Apply mode + `install-agent` + `poll.cmd`                    | The peer half. **Done.**                 |
+| **5** | Propagation (manifest, copy self + artifacts, atomic move, pruning) | **Done.** Needed only 3 - a run folder can be delivered and inspected before anything on the peer knows how to apply it. |
+
+Phase 5 shipped ahead of 4 deliberately: it is the half that proves the network path, the
+share permissions, and the manifest contract, and it can be verified by looking in `incoming`
+with no agent installed anywhere.
 
 Phases 1 and 2 deliver standalone value before any multi-server work exists.
 

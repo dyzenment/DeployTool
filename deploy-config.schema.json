@@ -590,8 +590,242 @@
             "string"
           ],
           "description": "Optional URL hit immediately after the flip so the app\u0027s cold start lands on this\nrequest rather than a real user\u0027s. A non-success response is treated as a failed\ndeploy and triggers an automatic flip back to the previous slot."
+        },
+        "stopSite": {
+          "type": "boolean",
+          "description": "Stop and start the IIS site as well as its app pool. Stopping the site closes its\nbindings, so nothing can connect at all - a stopped pool alone still accepts the\nconnection and answers 503. Only meaningful in classic mode; blue-green never stops\nanything, which is the point of it. Default: false."
+        },
+        "loadBalancer": {
+          "description": "Takes this instance out of rotation before the deploy and puts it back afterwards.\nOmit the block entirely and nothing changes: no notification, no wait.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/LoadBalancerConfig"
+            }
+          ]
         }
       }
+    },
+    "LoadBalancerConfig": {
+      "type": "object",
+      "description": "Wraps the deploy in a drain phase and a restore phase, so a box behind a load balancer\nstops receiving traffic before its site goes down and only receives it again once the\nnew build has warmed.\n            \nScoped per target rather than per server on purpose: rotation state is keyed per app\ninstance, so two sites on one box drain independently and deploying one does not pull\nthe other out of rotation.",
+      "additionalProperties": false,
+      "properties": {
+        "precheck": {
+          "description": "Decides whether any of this applies to the current run. Omit it and the drain/restore\nphases always run.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/LoadBalancerPrecheck"
+            }
+          ]
+        },
+        "drain": {
+          "description": "Runs before the app pool and site are stopped.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/LoadBalancerPhase"
+            }
+          ]
+        },
+        "restore": {
+          "description": "Runs after warmup succeeds. Skipped when the deploy failed and left a build that was\nnever verified live - see the restore policy on LoadBalancerGate.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/LoadBalancerPhase"
+            }
+          ]
+        }
+      }
+    },
+    "LoadBalancerPrecheck": {
+      "type": "object",
+      "description": "Decides up front whether this instance is actually in rotation, so a box that is already\nout of it - stopped site, maintenance, a flag someone flipped by hand - deploys with the\nplain routine instead of trying to drain something that is already drained.\n            \nThis is a real correctness fix, not just an optimisation: on an offline box the health\nendpoint is unreachable, so the drain notification would fail, and a failed drain aborts\nthe deploy by design. Without the precheck an offline server could not be updated at all.\n            \nThe test is positive - the load-balancer routine runs only when the instance answers with\nLiveStatus. Anything else, including a connection that is refused or times\nout, means \u0022not in rotation\u0022 and the whole block is skipped. Polling for a few seconds\nrather than asking once keeps a momentary blip on a genuinely live box from being read as\n\u0022offline\u0022, which would stop the site on live traffic.",
+      "additionalProperties": false,
+      "properties": {
+        "url": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Health endpoint to consult. Point it at localhost: the question is whether THIS\ninstance is serving, which a load balancer VIP cannot answer."
+        },
+        "liveStatus": {
+          "type": "integer",
+          "description": "Status that means \u0022in rotation, drain me properly\u0022. Default: 200. Any other response -\nor none at all - skips the drain and restore phases for this run.",
+          "format": "int32"
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "description": "How long to keep asking before concluding the instance is not in rotation. Kept short\nby default: this is dead time on every deploy of an offline box. Default: 10.",
+          "format": "int32"
+        },
+        "intervalSeconds": {
+          "type": "integer",
+          "description": "Gap between attempts. Default: 2.",
+          "format": "int32"
+        }
+      }
+    },
+    "LoadBalancerPhase": {
+      "type": "object",
+      "description": "One half of the rotation change: tell something, optionally confirm it took, then wait.\nEvery part is optional. A phase with only waitSeconds is just a pause; a phase with only\na notify is fire-and-forget.",
+      "additionalProperties": false,
+      "properties": {
+        "notify": {
+          "description": "The call that changes rotation state - typically an HTTP request to the endpoint that\nflips this instance\u0027s health flag. Omit to only verify and/or wait.",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/definitions/NotifyHook"
+            }
+          ]
+        },
+        "verifyUrl": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Polled until it answers with ExpectStatus. Verification is skipped\nentirely unless both this and expectStatus are set - with nothing to check against,\nthe phase assumes the notify worked and moves on.\n            \nPoint this at localhost, not at the load balancer VIP: a VIP response proves some\nnode is healthy, not that this one is in or out of rotation."
+        },
+        "expectStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "HTTP status verifyUrl must return before the phase proceeds - typically 500 after a\ndrain and 200 after a restore. Null disables verification.",
+          "format": "int32"
+        },
+        "verifyTimeoutSeconds": {
+          "type": "integer",
+          "description": "How long to keep polling verifyUrl before giving up. Default: 60.",
+          "format": "int32"
+        },
+        "verifyIntervalSeconds": {
+          "type": "integer",
+          "description": "Gap between verifyUrl polls. Default: 2.",
+          "format": "int32"
+        },
+        "waitSeconds": {
+          "type": "integer",
+          "description": "Fixed pause after the notify (and any verification) completes.\n            \nOn a drain this has a floor: a health-probe based balancer only removes the node\nafter unhealthyThreshold x probeInterval, and requests already in flight still need\nto finish. Set it below that sum and the site stops on live traffic, which is the\noutage this whole block exists to avoid. Verification confirms the flag flipped; it\ncannot confirm the balancer noticed, so the wait is doing real work either way.",
+          "format": "int32"
+        }
+      }
+    },
+    "NotifyHook": {
+      "type": "object",
+      "description": "A single side-effecting call. Which fields apply depends on Type:\n  http    - url (required), method, headers, body, expectStatus\n  file    - path (required), action\n  command - executable (required), arguments\n            \nurl, path, body, executable and arguments all support %ENV_VAR% expansion for credentials\nand the tokens {hostname}, {site} and {project}. Both are resolved on the box that runs\nthe step, never at plan time, because a peer receives this config verbatim and its\nhostname and environment differ from the primary\u0027s.",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/NotifyHookType"
+        },
+        "url": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "method": {
+          "type": "string",
+          "description": "HTTP verb. Default: POST."
+        },
+        "headers": {
+          "type": [
+            "null",
+            "object"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "body": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "expectStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Status the call itself must return to count as successful. Null accepts any 2xx.",
+          "format": "int32"
+        },
+        "path": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "File to create or delete, for the \u0022file\u0022 type."
+        },
+        "action": {
+          "description": "Whether the \u0022file\u0022 type creates or deletes Path. Default: create.",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/FileHookAction"
+            }
+          ]
+        },
+        "executable": {
+          "type": [
+            "null",
+            "string"
+          ],
+          "description": "Program to run, for the \u0022command\u0022 type."
+        },
+        "arguments": {
+          "type": [
+            "null",
+            "string"
+          ]
+        },
+        "timeoutSeconds": {
+          "type": "integer",
+          "description": "Applies to http and command. Default: 30.",
+          "format": "int32"
+        }
+      }
+    },
+    "NotifyHookType": {
+      "type": "string",
+      "description": "",
+      "x-enumNames": [
+        "Http",
+        "File",
+        "Command"
+      ],
+      "enum": [
+        "Http",
+        "File",
+        "Command"
+      ]
+    },
+    "FileHookAction": {
+      "type": "string",
+      "description": "",
+      "x-enumNames": [
+        "Create",
+        "Delete"
+      ],
+      "enum": [
+        "Create",
+        "Delete"
+      ]
     },
     "FolderConfig": {
       "type": "object",

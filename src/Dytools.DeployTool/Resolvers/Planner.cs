@@ -114,23 +114,28 @@ public static class Planner
         if (config.Servers.Count == 0)
             return [SelfOnly(selfHostname, allSteps)];
 
-        var self = config.Servers.FirstOrDefault(
-            s => string.Equals(s.Hostname, selfHostname, StringComparison.OrdinalIgnoreCase));
+        var match = HostIdentity.Find(config.Servers, selfHostname);
 
         // Host is not in servers[]. Deploy locally but propagate to nobody: an unlisted box
         // has no mandate to drive the fleet, and silently rolling out from an unknown
         // machine is the worse failure.
-        if (self is null)
+        if (match is null)
         {
             Console.WriteLine(
                 $"[Planner] This host ('{selfHostname}') is not listed in servers[] -- " +
-                "deploying locally only, no propagation.");
+                "deploying locally only, no propagation. " +
+                "Run 'dytools-deploy hostname --config <path>' to see what it would need to match.");
             return [SelfOnly(selfHostname, allSteps)];
         }
 
+        if (match.Reason != "hostname")
+            Console.WriteLine(
+                $"[Planner] This host ('{selfHostname}') matched servers[] entry " +
+                $"'{match.Server.Name}' by {match.Reason}.");
+
         return config.Servers.Select(server =>
         {
-            var isSelf = ReferenceEquals(server, self);
+            var isSelf = ReferenceEquals(server, match.Server);
             return new ServerPlan
             {
                 ServerName    = server.Name,

@@ -19,15 +19,84 @@ public sealed class IisHandler : IDeployTypeHandler
         Environment.GetFolderPath(Environment.SpecialFolder.Windows),
         "System32", "inetsrv", "appcmd.exe");
 
-    public Task<TargetDeployResult> ApplyAsync(ApplyStep step)
+    public async Task<TargetDeployResult> ApplyAsync(ApplyStep step)
     {
         var iis = step.Iis
             ?? throw new InvalidOperationException(
                 $"Project '{step.Project}': type is 'iis' but the 'iis' block is missing.");
 
-        return string.IsNullOrWhiteSpace(iis.SecondaryDeployPath)
-            ? ApplyClassicAsync(step, iis)
-            : ApplyBlueGreenAsync(step, iis);
+        var blueGreen = !string.IsNullOrWhiteSpace(iis.SecondaryDeployPath);
+        var tokens    = new TokenContext(iis.SiteName, step.Project);
+        var lb        = iis.LoadBalancer;
+
+        // Ask first whether this instance is in rotation at all. A box that is already out of
+        // it - stopped site, maintenance, a flag flipped by hand - takes the plain routine:
+        // draining something already drained is pointless, and on an offline box the drain
+        // notification cannot even be delivered, which would abort the deploy outright.
+        StepResult? precheckStep = null;
+        if (lb?.Precheck is not null)
+        {
+            var (inRotation, stepResult) = await LoadBalancerGate.PrecheckAsync(lb.Precheck, tokens);
+            precheckStep = stepResult;
+            if (!inRotation) lb = null;
+        }
+
+        if (lb is null)
+        {
+            var (plain, _) = blueGreen
+                ? await ApplyBlueGreenAsync(step, iis)
+                : await ApplyClassicAsync(step, iis);
+
+            if (precheckStep is not null) plain.DeploySteps.Insert(0, precheckStep);
+            return plain;
+        }
+
+        var result = new TargetDeployResult { TargetLabel = step.Label, Type = DeployType.Iis };
+        if (precheckStep is not null) result.DeploySteps.Add(precheckStep);
+
+        // Drain first, and treat a failure here as fatal before anything is stopped. The site
+        // is still up and serving at this point, so aborting costs a deploy; continuing would
+        // cost live requests.
+        if (!await LoadBalancerGate.RunPhaseAsync(lb.Drain, "drain", tokens, result.DeploySteps))
+        {
+            result.ErrorMessage = "Drain phase failed - the site was left untouched and in rotation.";
+            Console.WriteLine($"  [IIS] ✗ {result.ErrorMessage}");
+            return result;
+        }
+
+        var (inner, liveModified) = blueGreen
+            ? await ApplyBlueGreenAsync(step, iis)
+            : await ApplyClassicAsync(step, iis);
+
+        // Carry the inner attempt's outcome onto the result that already holds the drain steps.
+        result.TargetLabel = inner.TargetLabel;
+        result.Success     = inner.Success;
+        result.RolledBack  = inner.RolledBack;
+        result.ErrorMessage = inner.ErrorMessage;
+        result.PublishResult = inner.PublishResult;
+        result.DeploySteps.AddRange(inner.DeploySteps);
+
+        if (LoadBalancerGate.ShouldRestore(inner, liveModified))
+        {
+            if (!await LoadBalancerGate.RunPhaseAsync(lb.Restore, "restore", tokens, result.DeploySteps))
+            {
+                result.Success = false;
+                result.ErrorMessage = (result.ErrorMessage is null ? "" : result.ErrorMessage + " ") +
+                    "Restore phase failed - this instance is still out of rotation.";
+                Console.WriteLine($"  [IIS] ✗ {result.ErrorMessage}");
+            }
+        }
+        else
+        {
+            // Deliberately left drained: what is live was modified and never verified good.
+            result.DeploySteps.Add(ProcessRunner.Synthetic(
+                "restore skipped",
+                "Deploy failed with live files modified and no rollback - instance left OUT of rotation.",
+                success: false));
+            Console.WriteLine("  [IIS] ✗ Instance left OUT of rotation - deploy failed and nothing restored it.");
+        }
+
+        return result;
     }
 
     // -- Blue-green: mirror into the idle slot, then flip -----------------------
@@ -40,7 +109,13 @@ public sealed class IisHandler : IDeployTypeHandler
     /// Rollback is inherent: the previously-live slot is left untouched and still holds
     /// the last-known-good build, so recovery is one more flip.
     /// </summary>
-    private async Task<TargetDeployResult> ApplyBlueGreenAsync(ApplyStep step, IisConfig iis)
+    /// <returns>
+    /// The attempt's result, and whether what was live got modified. The second value drives
+    /// the load-balancer restore decision: a run that failed before the flip left the previous
+    /// build serving untouched, so the instance is safe to put back in rotation.
+    /// </returns>
+    private async Task<(TargetDeployResult Result, bool LiveModified)> ApplyBlueGreenAsync(
+        ApplyStep step, IisConfig iis)
     {
         var result = new TargetDeployResult { TargetLabel = step.Label, Type = DeployType.Iis };
 
@@ -50,7 +125,7 @@ public sealed class IisHandler : IDeployTypeHandler
                 $"Project '{step.Project}': 'secondaryDeployPath' is set (blue-green) but 'siteName' " +
                 "is missing - the site is what gets flipped between slots.";
             Console.WriteLine($"  [IIS] ✗ {result.ErrorMessage}");
-            return result;
+            return (result, false);
         }
 
         // Expanded here, on the box that owns the paths - never at plan time.
@@ -146,25 +221,51 @@ public sealed class IisHandler : IDeployTypeHandler
             // If we never flipped, the live slot was never touched - nothing to undo.
         }
 
-        return result;
+        return (result, flipped);
     }
 
     // -- Classic: stop pool, mirror in place, start pool ------------------------
 
-    private async Task<TargetDeployResult> ApplyClassicAsync(ApplyStep step, IisConfig iis)
+    /// <returns>
+    /// The attempt's result, and whether the live folder got modified. Mirroring deletes files
+    /// that are not in the artifact, so once it starts the folder is neither the old build nor
+    /// the new one until it finishes - which is what the restore decision turns on.
+    /// </returns>
+    private async Task<(TargetDeployResult Result, bool LiveModified)> ApplyClassicAsync(
+        ApplyStep step, IisConfig iis)
     {
         // Expanded here, on the box that owns the path - %ProgramData% and friends can
         // differ between the primary and a peer.
         var deployPath = FileHelper.ExpandEnvVars(iis.DeployPath);
         var result     = new TargetDeployResult { TargetLabel = step.Label, Type = DeployType.Iis };
 
-        string? backupDir = null;
+        string? backupDir    = null;
+        var     liveModified = false;
+        var     siteStopped  = false;
+
+        // 1062 is "the service has not been started" - stopping something already stopped is
+        // the desired end state, not a failure.
+        static bool StopSucceeded(int code) => code is 0 or 1062;
 
         try
         {
+            // Site before pool: closing the bindings stops new connections arriving, then
+            // stopping the pool tears down the worker that is finishing the rest.
+            if (iis.StopSite)
+            {
+                if (string.IsNullOrWhiteSpace(iis.SiteName))
+                    throw new DeployException(
+                        $"Project '{step.Project}': 'stopSite' is set but 'siteName' is missing.");
+
+                var stopSite = await AppCmdAsync("Stop site",
+                    $"stop site /site.name:\"{iis.SiteName}\"", StopSucceeded);
+                result.DeploySteps.Add(stopSite);
+                if (!stopSite.Success) throw new DeployException($"Failed to stop site '{iis.SiteName}'.");
+                siteStopped = true;
+            }
+
             var stopResult = await AppCmdAsync("Stop app pool",
-                $"stop apppool /apppool.name:\"{iis.AppPool}\"",
-                code => code == 0 || code == 1062);
+                $"stop apppool /apppool.name:\"{iis.AppPool}\"", StopSucceeded);
             result.DeploySteps.Add(stopResult);
             if (!stopResult.Success) throw new DeployException($"Failed to stop app pool '{iis.AppPool}'.");
 
@@ -179,6 +280,9 @@ public sealed class IisHandler : IDeployTypeHandler
             StepResult copyResult;
             try
             {
+                // From here the live folder is in an indeterminate state until the mirror
+                // completes: it deletes whatever the artifact does not contain.
+                liveModified = true;
                 FileHelper.MirrorDirectory(step.Artifact, deployPath);
                 copyResult = ProcessRunner.Synthetic("Mirror files to IIS path", $"{step.Artifact} -> {deployPath}");
             }
@@ -189,9 +293,19 @@ public sealed class IisHandler : IDeployTypeHandler
             result.DeploySteps.Add(copyResult);
             if (!copyResult.Success) throw new DeployException("File copy to IIS path failed.");
 
+            // Pool before site, the mirror of the stop order: the worker is ready before the
+            // bindings reopen, so the first request in does not race a starting pool.
             var startResult = await AppCmdAsync("Start app pool", $"start apppool /apppool.name:\"{iis.AppPool}\"");
             result.DeploySteps.Add(startResult);
             if (!startResult.Success) throw new DeployException($"Failed to start app pool '{iis.AppPool}'.");
+
+            if (siteStopped)
+            {
+                var startSite = await AppCmdAsync("Start site", $"start site /site.name:\"{iis.SiteName}\"");
+                result.DeploySteps.Add(startSite);
+                if (!startSite.Success) throw new DeployException($"Failed to start site '{iis.SiteName}'.");
+                siteStopped = false;
+            }
 
             if (!string.IsNullOrWhiteSpace(iis.WarmupUrl))
             {
@@ -220,6 +334,12 @@ public sealed class IisHandler : IDeployTypeHandler
             var recovery = await AppCmdAsync("Start app pool (error recovery)",
                 $"start apppool /apppool.name:\"{iis.AppPool}\"");
             result.DeploySteps.Add(recovery);
+
+            // Leaving the site stopped would keep it dark even after a successful rollback,
+            // so bring the bindings back whatever else went wrong.
+            if (siteStopped)
+                result.DeploySteps.Add(await AppCmdAsync("Start site (error recovery)",
+                    $"start site /site.name:\"{iis.SiteName}\""));
         }
         finally
         {
@@ -227,7 +347,7 @@ public sealed class IisHandler : IDeployTypeHandler
                 FileHelper.TryDeleteDirectory(backupDir);
         }
 
-        return result;
+        return (result, liveModified);
     }
 
     // -- Helpers ---------------------------------------------------------------

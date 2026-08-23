@@ -43,8 +43,10 @@ Distributed as a [.NET tool](https://learn.microsoft.com/dotnet/core/tools/globa
 3. It runs each project's **unit tests** - a failure aborts that project.
 4. It **publishes and delivers** each target: IIS (optionally blue-green), a folder (stopping and
    starting a Windows service around the copy), or a Velopack package.
-5. On a **fleet**, the box running the job deploys first; peers apply after a soak delay, and a
-   failed target rolls back.
+5. On a **fleet**, the box running the job deploys first, then hands every peer a complete run
+   folder - manifest, artifacts, and the tool itself - staged and moved into place atomically.
+   Peers receive nothing unless the primary succeeded. Each peer's own agent picks the folder up,
+   waits out the soak window, and applies it. See [Setting up a peer](#setting-up-a-peer).
 6. It writes a **run report**.
 
 Commit-message directives (`pub:`, `wait:`) and command-line overrides (`--pub`, `--wait`) steer
@@ -129,12 +131,25 @@ dytools-deploy --config deploy-config.json --changed "src/App/Foo.cs|src/Lib/Bar
 | `--pub "<patterns>"` | Override the commit's `pub:` - pipe-separated name globs (`"Web\|Proc*"`, `"*"`, `"none"`). Selects projects by name regardless of `--changed`. |
 | `--wait <seconds>` | Override the commit's `wait:` rollout soak delay. `0` = peers apply immediately. |
 | `--skip-tests [true\|false]` | Bypass the unit-test gate. Usable bare (`--skip-tests`). Overrides the commit's `skiptests`; pass `false` to force the gate on for a commit that asked to skip it. |
+| `--server <name>` | Pin which `servers[]` entry this box is, instead of matching on machine name. See [Which server am I?](#which-server-am-i). |
 
 The tool exits `0` on success, `1` on failure. Which projects deploy is decided from the
 changed-file list against each project's folder, its `.csproj` `ProjectReference`s (resolved
 automatically), and any extra `dependentProjects` triggers. Directives `pub:<pattern>`,
 `wait:<seconds>` and `skiptests` are read from the `HEAD` commit; `--pub` / `--wait` /
 `--skip-tests` override them field by field (see [Running it by hand](#running-it-by-hand)).
+
+### Other commands
+
+| Command | Description |
+|---------|-------------|
+| `dytools-deploy init [path]` | Scaffold a `deploy-config.json` interactively. |
+| `dytools-deploy edit <path>` | Edit an existing one. |
+| `dytools-deploy hostname [--config <path>]` | Print every name this box is known by, and which `servers[]` entry it matches. |
+| `dytools-deploy install-agent` | Stand this box up as a peer: folder layout, poll script, scheduled task. |
+| `dytools-deploy uninstall-agent` | Remove the schedule. Folders and deploy history are left alone. |
+| `dytools-deploy apply [incoming]` | Apply whatever is due in an incoming folder. Run by the agent; usually not by hand. |
+| `dytools-deploy help` | Usage summary. |
 
 ## Minimal config
 
@@ -242,8 +257,32 @@ for that run (matched by `hostname`), and every other listed server is a peer.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `name` | string | `""` | Short label used in logs, manifests, and reports. |
-| `hostname` | string | `""` | Matched case-insensitively against the machine name to decide which entry the running box is. |
+| `hostname` | string | `""` | Matched against the running box's name to decide which entry it is. See [Which server am I?](#which-server-am-i). |
 | `incomingShare` | string | `null` | UNC path where the primary drops run folders for this peer, e.g. `\\WEB02\deploy\incoming`. Unused on whichever box is currently the primary (it applies inline). |
+
+`incomingShare` must be a **subfolder of a share, not the share root**: the primary copies into a
+`staging` folder beside it (`\\WEB02\deploy\staging\<runId>`) and then *moves* the finished
+folder into `incoming`. Within one share that move is a rename, and therefore atomic - which is
+what stops a peer ever seeing a half-copied run. Point `incomingShare` at a share root and there
+is nowhere to stage beside it, so the run fails saying so rather than quietly degrading to a
+non-atomic copy.
+
+The account the deploy runs as needs write access to that share, and the primary needs to reach
+port 445 on the peer.
+
+A delivered run folder is entirely self-describing - `deploy-config.json` never travels:
+
+```
+\\WEB02\deploy\incoming\20260819-154000-f419e13\
+  manifest.json          <- this peer's steps, plus notBeforeUtc
+  DeployTool.exe         <- the binary that planned the run, so peer and primary cannot skew
+  artifacts\
+    Web-folder\...       <- only what this peer's own steps reference
+```
+
+Delivery happens **only after the primary's own apply succeeded**, so a broken build never
+reaches the fleet. A peer that cannot be written to fails that peer alone and fails the run;
+the others are still delivered.
 
 ### Rollout
 
@@ -251,6 +290,73 @@ for that run (matched by `hostname`), and every other listed server is a peer.
 |-------|------|---------|-------------|
 | `delaySeconds` | int | `3600` | Soak time between the primary going live and peers applying. Clock starts at **primary success**. Overridden per run by `wait:` / `--wait`. |
 | `keepRuns` | int | `5` | Run folders retained per peer before the oldest are pruned. |
+
+### Which server am I?
+
+Every box works out which `servers[]` entry it is on its own - there is no primary flag and no
+per-machine config file. The name it identifies as comes from the first of these that is set:
+
+| Source | When to use it |
+|--------|----------------|
+| `--server <name>` | One run, by hand. Also handy for testing a config against another box's identity. |
+| `DEPLOYTOOL_SERVER` env var | Set once on a box the fleet calls something other than what Windows does - a renamed host, a container, an image cloned from a template. |
+| Machine name | The default, and the zero-configuration case. |
+
+That name is then matched against `servers[]` in three passes, strictest first: exact `hostname`,
+exact `name`, then short name (so `WEB01` and `web01.corp.local` are the same box, either way
+round). All comparisons are case-insensitive. If two entries claim the same box the run stops
+rather than guessing.
+
+**A box that matches nothing still deploys itself perfectly well - it just propagates to nobody,
+and a green run says nothing about it.** That silence is the reason for:
+
+```bash
+dytools-deploy hostname --config deploy-config.json
+```
+
+It prints every name the box is known by, which entry it matched and why, and - when nothing
+matched - the entry to paste in. It exits `1` on no match, so a fleet check can be scripted.
+
+### Setting up a peer
+
+Two steps per box. On the peer, in an **elevated** shell:
+
+```bash
+dytools-deploy install-agent
+```
+
+That creates `C:\deploy\{agent,staging,incoming}`, writes the poll script, and registers a
+`DeployAgent` scheduled task that runs it every minute as `SYSTEM`. It is idempotent - run it
+again to upgrade a box, and existing run folders are left alone. It finishes by printing the
+`servers[]` entry to paste into your `deploy-config.json`, which is step two.
+
+| Switch | Default | Description |
+|--------|---------|-------------|
+| `--root <path>` | `C:\deploy` (Windows), `/var/lib/deploytool` | Agent root. `incoming` and `staging` must stay siblings - the handoff relies on it. |
+| `--interval <minutes>` | `1` | How often the task polls. |
+| `--task-name <name>` | `DeployAgent` | Scheduled task name. |
+| `--user <account>` | `SYSTEM` | `SYSTEM`, `LOCALSERVICE` or `NETWORKSERVICE`. Anything needing a password is printed as a command for you to run - this tool does not handle credentials. |
+
+Then share the root so the primary can reach `\\PEER\deploy\incoming`, and give the primary's
+account write access to it - **both** the share permission and the NTFS permission. This is the
+usual reason a first rollout fails.
+
+**What actually happens on a peer.** The primary copies the run into `staging\<runId>` and then
+*moves* it into `incoming\<runId>`; a move within one share is atomic, so the poller can never
+see a half-copied run. Every minute the task runs `poll.cmd`, which finds the newest run folder
+and launches **the tool that arrived inside it** - the peer has no installed copy to keep in step
+with the primary. That tool scans `incoming`, skips runs whose soak window has not passed, applies
+the rest oldest-first, and writes a `result.json` into each.
+
+That `result.json` is the completion marker as well as the audit record: manifest present and no
+`result.json` means pending. It is written on failure too, so a broken run is recorded once rather
+than retried every minute forever. Watch it all in `C:\deploy\agent\agent.log`.
+
+The peer needs the .NET runtime installed - it does not need the SDK, a checkout, or a
+`deploy-config.json`. Everything it is meant to do arrives in the run folder's `manifest.json`.
+
+On Linux or macOS `install-agent` creates the same layout and a `poll.sh`, then prints the crontab
+line for you to add - it will not edit a server's crontab behind your back.
 
 ### Pack cache
 
@@ -300,6 +406,7 @@ for that run (matched by `hostname`), and every other listed server is a peer.
 
 Classic mode: stop app pool → mirror artifact into `deployPath` → start pool.
 Set `secondaryDeployPath` to enable **blue-green** instead (no pool stop during copy).
+Set `loadBalancer` to drain the instance out of rotation around either of them.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -308,6 +415,75 @@ Set `secondaryDeployPath` to enable **blue-green** instead (no pool stop during 
 | `siteName` | string | `null` | IIS site name. Required only for blue-green (the site is what gets flipped). |
 | `secondaryDeployPath` | string | `null` | Slot B. Setting it turns on blue-green: the artifact is mirrored into whichever slot is **not** live, then the site's physical path is flipped to it. |
 | `warmupUrl` | string | `null` | URL hit immediately after the flip so cold start lands here, not on a real user. A non-success response fails the deploy and flips back to the previous slot. |
+| `stopSite` | bool | `false` | Stop and start the site as well as the pool. A stopped pool still accepts connections and answers 503; a stopped site closes its bindings entirely. Classic mode only. |
+| `loadBalancer` | object | `null` | Drain this instance out of rotation before the deploy and put it back after warmup. See below. |
+
+#### Behind a load balancer
+
+Omit `loadBalancer` and nothing changes. With it, a classic deploy runs:
+
+```
+precheck  ── not in rotation ─→ plain routine, no drain, no restore
+    │ in rotation
+    ↓
+drain notify → drain verify → drain wait
+  → stop site → stop pool → snapshot → mirror → start pool → start site → warmup
+→ restore notify → restore verify → restore wait
+```
+
+```jsonc
+"loadBalancer": {
+  "precheck": { "url": "http://localhost/health", "liveStatus": 200 },
+  "drain": {
+    "notify":       { "type": "http", "url": "http://localhost/admin/health?node={hostname}&site={site}&up=false" },
+    "verifyUrl":    "http://localhost/health",
+    "expectStatus": 500,
+    "waitSeconds":  20
+  },
+  "restore": {
+    "notify":       { "type": "http", "url": "http://localhost/admin/health?node={hostname}&site={site}&up=true" },
+    "verifyUrl":    "http://localhost/health",
+    "expectStatus": 200,
+    "waitSeconds":  30
+  }
+}
+```
+
+Every part is optional. A phase with only `waitSeconds` is a plain pause; **verification is skipped
+unless both `verifyUrl` and `expectStatus` are set**, in which case the phase assumes the notify
+worked. `notify.type` is `http` (default), `file` (create/delete a marker the probe looks for), or
+`command`. URLs, paths, bodies and arguments support `%ENV_VAR%` expansion and the tokens
+`{hostname}`, `{site}`, `{project}`, all resolved on the box that runs the step - never at plan
+time, since peers receive the same config.
+
+**`precheck` handles the offline box.** Deploying to a server that's already out of rotation —
+stopped site, maintenance, a flag flipped by hand — shouldn't try to drain what's already
+drained. More than that: on an offline box the health endpoint is unreachable, so the drain
+notification would fail, and a failed drain aborts the deploy. Without the precheck an offline
+server couldn't be updated at all.
+
+The test is positive: the routine runs **only** when the endpoint answers with `liveStatus`
+(default 200). Anything else — 500, 503, or a connection refused — means "not in rotation" and
+both phases are skipped for that run. It polls for `timeoutSeconds` (default 10) rather than
+asking once, so a momentary blip on a genuinely live box isn't misread as offline, which would
+stop the site on live traffic. Omit `precheck` and the phases always run.
+
+Three more things worth knowing:
+
+- **`drain.waitSeconds` has a floor.** A probe-based balancer only removes the node after
+  `unhealthyThreshold × probeInterval`, and in-flight requests still need to finish. Set it below
+  that sum and the site stops on live traffic. Verifying `localhost` proves the flag flipped; it
+  cannot prove the balancer noticed, which is what the wait covers.
+- **Point `verifyUrl` at localhost, not the VIP.** A VIP response proves *some* node is healthy,
+  not that this one is in or out of rotation.
+- **A failed drain aborts before anything stops.** The site is still serving at that point, so
+  aborting costs a deploy while continuing would cost requests.
+
+After a failed deploy the instance is restored to rotation only if the previous build is still
+what's live - either the deploy rolled back, or it failed before touching live files. Otherwise it
+is **left drained** and the run fails, because `mirror` deletes files the artifact doesn't contain,
+so an interrupted mirror leaves neither the old build nor the new one. Note `rollback` defaults to
+`false`; with it off, a mid-mirror failure leaves the instance out of rotation for a human.
 
 ### Folder target
 
