@@ -337,7 +337,9 @@ again to upgrade a box, and existing run folders are left alone. It finishes by 
 | `--root <path>` | `C:\deploy` (Windows), `/var/lib/deploytool` | Agent root. `incoming` and `staging` must stay siblings - the handoff relies on it. |
 | `--interval <minutes>` | `1` | How often the task polls. |
 | `--task-name <name>` | `DeployAgent` | Scheduled task name. |
-| `--user <account>` | `SYSTEM` | `SYSTEM`, `LOCALSERVICE` or `NETWORKSERVICE`. Anything needing a password is printed as a command for you to run - this tool does not handle credentials. |
+| `--user <account>` | `SYSTEM` | Who the scheduled **task** runs as: `SYSTEM`, `LOCALSERVICE` or `NETWORKSERVICE`. Anything needing a password is printed as a command for you to run. |
+| `--account <name>` | `deploysvc` | Local account the **primary** connects as. Install offers to create it and grant it the share. |
+| `--no-prompt` | off | Skip that offer and print the commands instead. Implied when stdin is not a console. |
 
 Then share the root so the primary can reach `\\PEER\deploy\incoming`, and give the primary's
 account write access to it - **both** the share permission and the NTFS permission. This is the
@@ -369,9 +371,9 @@ Summarised here for reference.
 into `incoming\<runId>` - the move is what makes the handoff atomic - and prunes old runs
 afterwards. It needs write and delete on both folders:
 
-```bat
+```powershell
 net share deploy=C:\deploy /grant:deploysvc,CHANGE
-icacls C:\deploy /grant deploysvc:(OI)(CI)M
+icacls C:\deploy /grant "deploysvc:(OI)(CI)M"
 ```
 
 Both commands matter: the SMB share permission and the NTFS permission are separate gates and the
@@ -390,16 +392,29 @@ on the share will not help. Two ways out:
 | Config | `username` + `password` | nothing |
 | Cost | a secret to manage | reconfiguring the runner, and two passwords to keep in step forever |
 
+> **`install-agent` offers to do the peer half for you.** Run elevated, answer `y`, and type a
+> password at the prompt: it creates the account, shares the folder, and grants both permissions.
+> The password is read without echo and passed to the Win32 `NetUserAdd` API rather than to
+> `net user <name> <password> /add` - a password on a command line is readable by any user on the
+> box via `Win32_Process` for as long as the process lives. It skips the offer and prints the
+> commands instead when stdin is not a console (CI) or you pass `--no-prompt`; `--account <name>`
+> changes the name from `deploysvc`.
+>
+> The commands below are what it runs, for when you would rather do it yourself.
+
 #### Option A - credentials in config
 
 On the **peer only**, elevated:
 
-```bat
-net user deploysvc "<strong-password>" /add
-wmic useraccount where "name='deploysvc'" set PasswordExpires=false
+```powershell
+New-LocalUser -Name deploysvc -PasswordNeverExpires -Description "DeployTool share access" `
+  -Password (Read-Host -AsSecureString "Password for deploysvc")
 net share deploy=C:\deploy /grant:deploysvc,CHANGE
-icacls C:\deploy /grant deploysvc:(OI)(CI)M
+icacls C:\deploy /grant "deploysvc:(OI)(CI)M"
 ```
+
+`Read-Host -AsSecureString` keeps the password out of your shell history. The quotes on `icacls`
+are required in PowerShell - unquoted, it evaluates `(OI)` as a command.
 
 The account needs nothing beyond the share - it never logs on interactively, so it does not
 need to be an administrator and should not be one. Then in `deploy-config.json`:
@@ -420,9 +435,9 @@ Nothing changes on the primary.
 
 Create the **same username with the same password** on both boxes:
 
-```bat
-net user deploysvc "<strong-password>" /add
-wmic useraccount where "name='deploysvc'" set PasswordExpires=false
+```powershell
+New-LocalUser -Name deploysvc -PasswordNeverExpires `
+  -Password (Read-Host -AsSecureString "Password for deploysvc")
 ```
 
 Grant it the share on the peer (the `net share` / `icacls` pair above), then on the primary

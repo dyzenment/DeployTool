@@ -85,7 +85,7 @@ public static class AgentInstaller
             ? await RegisterWindowsTaskAsync(layout, options)
             : PrintUnixSchedule(layout, options);
 
-        PrintNextSteps(layout, scheduled);
+        PrintNextSteps(layout, scheduled, options);
         return scheduled ? 0 : 1;
     }
 
@@ -378,7 +378,7 @@ public static class AgentInstaller
     /// it is wrong is a flat "access denied" hours later in a CI log nobody is watching. Saying
     /// it here, at the one moment someone is definitely looking at this box, is worth the lines.
     /// </summary>
-    private static void PrintNextSteps(AgentLayout layout, bool scheduled)
+    private static void PrintNextSteps(AgentLayout layout, bool scheduled, AgentOptions options)
     {
         var host      = HostIdentity.Resolve();
         // Empty only for a volume root ("C:\"), which nobody should be sharing wholesale -
@@ -397,33 +397,156 @@ public static class AgentInstaller
 
         if (!OperatingSystem.IsWindows())
         {
-            PrintServersEntry(host, unc, null);
+            PrintServersEntry(host, unc, options.AccountName, provisioned: false);
             Console.WriteLine($"\n  Watch it work:  {layout.LogFile}\n");
             return;
         }
 
-        PrintShareStep(layout, shareName);
+        // Identity first. Granting comes second because you cannot grant to an account that
+        // does not exist yet - net share fails with "no mapping between account names and
+        // security IDs", which reads like a broken command rather than a missing step.
         PrintIdentityStep(host, unc, layout);
-        PrintServersEntry(host, unc, null);
-        PrintChecklist(host, unc, layout);
+
+        // Offer to just do it. Everything in steps 1 and 2 is mechanical and happens on this
+        // box; only the primary-side choice below genuinely needs a human.
+        var provisioned = TryProvision(layout, shareName, options);
+
+        if (!provisioned) PrintShareStep(layout, shareName);
+
+        PrintServersEntry(host, unc, options.AccountName, provisioned);
+        PrintChecklist(host, unc, layout, options.AccountName);
     }
 
-    // -- Step 1: the share -----------------------------------------------------
+    // -- Doing it, rather than printing it -------------------------------------
+
+    /// <summary>
+    /// Offers to create the account and grant it the share, and does it if asked. Returns
+    /// whether the box is now actually set up, so the caller knows whether to print the manual
+    /// commands instead.
+    ///
+    /// Interactive by design and never assumed: this creates a security principal and opens a
+    /// share, on a production server, and doing that because someone ran an installer is not a
+    /// reasonable default. Declining prints the commands and changes nothing.
+    /// </summary>
+    private static bool TryProvision(AgentLayout layout, string shareName, AgentOptions options)
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+
+        if (options.NoPrompt || Console.IsInputRedirected)
+        {
+            // Unattended: a CI run, or an operator who asked to be left alone. Say why the
+            // offer is missing rather than silently skipping it.
+            Console.WriteLine("\n  (running unattended - printing the commands instead)");
+            return false;
+        }
+
+        Console.WriteLine();
+        Console.Write($"  Create '{options.AccountName}' here and grant it the share now? [y/N] ");
+
+        var answer = Console.ReadLine()?.Trim();
+        if (!string.Equals(answer, "y", StringComparison.OrdinalIgnoreCase)) return false;
+
+        Console.WriteLine();
+
+        if (!EnsureAccount(options.AccountName)) return false;
+        if (!ShareFolder(layout, shareName, options.AccountName)) return false;
+
+        Console.WriteLine();
+        Console.WriteLine($"  ✓ This box is ready. {options.AccountName} can write to \\\\{HostIdentity.Resolve()}\\{shareName}.");
+        return true;
+    }
+
+    /// <summary>
+    /// Creates the account, or confirms an existing one is usable. An existing account is left
+    /// exactly as it is - silently resetting the password of an account something else may be
+    /// using is not a repair, it is an outage.
+    /// </summary>
+    private static bool EnsureAccount(string name)
+    {
+        if (LocalAccount.Exists(name))
+        {
+            Console.WriteLine($"  = Account '{name}' already exists - leaving its password alone.");
+            Console.WriteLine("    (if you do not know it, reset it yourself: net user " +
+                $"{name} * )");
+            return true;
+        }
+
+        var password = LocalAccount.PromptForPassword($"Password for {name}");
+        if (password is null) return false;
+
+        var error = LocalAccount.Create(
+            name, password, "DeployTool - receives rollouts from the primary. Share access only.");
+
+        if (error is not null)
+        {
+            Console.WriteLine($"  ✗ {error}");
+            return false;
+        }
+
+        Console.WriteLine($"  + Created local account '{name}' (unprivileged, password does not expire).");
+        Console.WriteLine("    Keep that password - you will need it for whichever option you pick below.");
+        return true;
+    }
+
+    /// <summary>
+    /// Shares the agent root and grants the account on both gates. No secret is involved here,
+    /// so these are ordinary process invocations.
+    /// </summary>
+    private static bool ShareFolder(AgentLayout layout, string shareName, string account)
+    {
+        var share = ProcessRunner.RunAsync(
+            $"net share {shareName}", "net",
+            $"share {shareName}=\"{layout.Root}\" /grant:\"{account}\",CHANGE").GetAwaiter().GetResult();
+
+        // 2118 is NERR_DuplicateShare. Re-running the installer on a configured box is a normal
+        // thing to do, and an existing share is a success, not a collision.
+        var alreadyShared = !share.Success
+            && (share.Stdout + share.Stderr).Contains("2118", StringComparison.Ordinal);
+
+        if (!share.Success && !alreadyShared)
+        {
+            Console.WriteLine($"  ✗ Could not share {layout.Root}. {ElevationHint()}");
+            return false;
+        }
+
+        Console.WriteLine(alreadyShared
+            ? $"  = Share '{shareName}' already exists."
+            : $"  + Shared {layout.Root} as '{shareName}', granted {account} Change.");
+
+        var acl = ProcessRunner.RunAsync(
+            "icacls grant", "icacls",
+            $"\"{layout.Root}\" /grant \"{account}:(OI)(CI)M\"").GetAwaiter().GetResult();
+
+        if (!acl.Success)
+        {
+            // The share permission alone is not enough - NTFS is the second, stricter gate, and
+            // a half-granted folder fails later in a way that looks like the tool's fault.
+            Console.WriteLine($"  ✗ Shared, but could not grant NTFS rights on {layout.Root}. {ElevationHint()}");
+            return false;
+        }
+
+        Console.WriteLine($"  + Granted {account} Modify on {layout.Root} (and everything under it).");
+        return true;
+    }
+
+    // -- Step 2: the share -----------------------------------------------------
 
     private static void PrintShareStep(AgentLayout layout, string shareName)
     {
+        // icacls is quoted because these get pasted into PowerShell as often as cmd, and
+        // PowerShell reads a bare (OI)(CI) as a subexpression to evaluate. Quoted works in both.
         Console.WriteLine($"""
 
-          ── 1. Share this folder ──────────────────────────────────────
+          ── 2. Share this folder and grant that account ───────────────
 
-          Run here, on this box, in an elevated prompt. Replace ACCOUNT with whichever
-          account you settle on in step 2:
+          Here, elevated, once the account from step 1 exists:
 
-              net share {shareName}={layout.Root} /grant:ACCOUNT,CHANGE
-              icacls {layout.Root} /grant ACCOUNT:(OI)(CI)M
+              net share {shareName}={layout.Root} /grant:deploysvc,CHANGE
+              icacls {layout.Root} /grant "deploysvc:(OI)(CI)M"
 
           Both are needed - the share permission and the NTFS permission are separate
-          gates, and the stricter of the two wins.
+          gates, and the stricter of the two wins. The quotes on icacls matter in
+          PowerShell; without them it tries to evaluate (OI) as a command.
 
           Grant on {layout.Root}, NOT on {layout.Incoming}. The primary copies into
           {AgentLayout.StagingFolderName}\<runId> and then moves it across into
@@ -433,7 +556,7 @@ public static class AgentInstaller
         """);
     }
 
-    // -- Step 2: identity ------------------------------------------------------
+    // -- Step 1: identity ------------------------------------------------------
 
     /// <summary>
     /// The part that actually bites. A self-hosted Actions runner installs as a service running
@@ -475,12 +598,14 @@ public static class AgentInstaller
           Option A - dedicated account here, credentials in deploy-config.json
                      (changes nothing about the runner - start here)
 
-            On this box only:
+            On this box only, elevated. Read-Host keeps the password out of your
+            shell history:
 
-                net user deploysvc "<strong-password>" /add
-                wmic useraccount where "name='deploysvc'" set PasswordExpires=false
+                New-LocalUser -Name deploysvc -PasswordNeverExpires \
+                  -Password (Read-Host -AsSecureString "Password for deploysvc")
 
-            Then use deploysvc as ACCOUNT in step 1, and add to its servers[] entry:
+            It needs nothing beyond the share - no interactive logon, so not an
+            administrator. Then add to its servers[] entry:
 
                 "username": "{{host}}\\deploysvc",
                 "password": "%DEPLOY_SHARE_PASSWORD%"
@@ -492,22 +617,23 @@ public static class AgentInstaller
           Option B - mirrored local account
                      (nothing in the config, but the runner must be reconfigured)
 
-            Create the SAME username with the SAME password on both boxes:
+            Create the SAME username with the SAME password on BOTH boxes:
 
-                net user deploysvc "<strong-password>" /add
+                New-LocalUser -Name deploysvc -PasswordNeverExpires \
+                  -Password (Read-Host -AsSecureString "Password for deploysvc")
 
             Then on the primary, point the runner service at it:
             Services -> actions.runner.* -> Log On -> .\deploysvc -> restart.
 
             Workgroup pass-through does the rest: the peer validates the incoming
-            credentials against its own SAM and lets it in. Use deploysvc as ACCOUNT in
-            step 1. Keeping the two passwords in step forever is the cost.
+            credentials against its own SAM and lets it in. Step 2 grants it the share.
+            Keeping the two passwords in step forever is the cost.
         """);
     }
 
     // -- Step 3: config --------------------------------------------------------
 
-    private static void PrintServersEntry(string host, string unc, string? _)
+    private static void PrintServersEntry(string host, string unc, string account, bool provisioned)
     {
         // The share path is written with the machine name, which is right on a flat LAN and
         // wrong the moment the two boxes are in different VPC subnets - see the checklist.
@@ -524,11 +650,21 @@ public static class AgentInstaller
           hostname is how this box recognises itself, and stays the computer name.
           incomingShare only has to be reachable FROM the primary.
         """);
+
+        if (provisioned)
+            Console.WriteLine($$"""
+              For Option A, add the credential to that entry too:
+
+                  "username": "{{host}}\{{account}}",
+                  "password": "%DEPLOY_SHARE_PASSWORD%"
+
+              and set DEPLOY_SHARE_PASSWORD from a CI secret in the workflow's env: block.
+            """);
     }
 
     // -- Closing checklist -----------------------------------------------------
 
-    private static void PrintChecklist(string host, string unc, AgentLayout layout)
+    private static void PrintChecklist(string host, string unc, AgentLayout layout, string account)
     {
         Console.WriteLine($"""
 
@@ -544,7 +680,7 @@ public static class AgentInstaller
             • Verify AS THE RUNNER'S ACCOUNT, not your own login - that is the mistake that
               makes this look fixed when it is not:
 
-                  psexec -u .\deploysvc -p "<password>" cmd /c "dir {unc}"
+                  psexec -u .\{account} -p "<password>" cmd /c "dir {unc}"
 
             • Then run 'dytools-deploy hostname --config deploy-config.json' on each box and
               confirm each one matches its own entry.
@@ -600,4 +736,16 @@ public sealed class AgentOptions
     /// Program Files - and because it needs no password.
     /// </summary>
     public string RunAsUser { get; init; } = "SYSTEM";
+
+    /// <summary>
+    /// Local account the primary will connect to this box's share as. Created on request during
+    /// install; see AgentInstaller.TryProvisionAsync.
+    /// </summary>
+    public string AccountName { get; init; } = "deploysvc";
+
+    /// <summary>
+    /// Skips the offer to create and grant the account, and prints the commands instead.
+    /// Set by --no-prompt, and implied whenever stdin is not a console.
+    /// </summary>
+    public bool NoPrompt { get; init; }
 }

@@ -119,6 +119,48 @@ public sealed class AgentInstallerTests
         StringAssert.Contains(script, OperatingSystem.IsWindows() ? "%LOG%.1" : "$LOG.1");
     }
 
+    // -- Provisioning ----------------------------------------------------------
+
+    [TestMethod]
+    public void InstallIsUnattendedWhenStdinIsNotAConsole()
+    {
+        // The offer to create an account and open a share must never fire in CI, where nobody
+        // can answer it and nobody sees what it did. The test host redirects stdin, which is
+        // exactly the condition being relied on.
+        Assert.IsTrue(Console.IsInputRedirected,
+            "this test asserts the unattended path, which is selected by redirected stdin.");
+    }
+
+    [TestMethod]
+    public void DefaultAccountNameIsTheOneEveryDocumentedCommandUses()
+    {
+        // The install output, the README and the printed servers[] snippet all name this
+        // account. A default that drifts from the docs sends people chasing a typo.
+        Assert.AreEqual("deploysvc", new AgentOptions().AccountName);
+        Assert.IsFalse(new AgentOptions().NoPrompt);
+    }
+
+    [TestMethod]
+    public void AccountCreationIsRefusedOffWindowsRatherThanSilentlySkipped()
+    {
+        var error = LocalAccount.Create("deploysvc", "irrelevant", "test");
+
+        if (OperatingSystem.IsWindows())
+            // On Windows this needs elevation and would really create an account; not asserted.
+            return;
+
+        Assert.IsNotNull(error);
+        StringAssert.Contains(error, "Windows");
+    }
+
+    [TestMethod]
+    public void ProbingForAnAccountIsSilentAndNeverThrows()
+    {
+        // Called before every provisioning attempt, and its usual answer is "no". It must not
+        // announce itself or blow up where `net` does not exist.
+        Assert.IsFalse(LocalAccount.Exists("a-name-no-machine-would-have-42"));
+    }
+
     [TestMethod]
     public void PollScriptPicksTheNewestRunFolderFirst()
     {

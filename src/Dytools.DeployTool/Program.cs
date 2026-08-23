@@ -365,9 +365,11 @@ internal class Program
 
         return new AgentOptions
         {
-            Root      = parsed.GetOptional("root")      ?? AgentInstaller.DefaultRoot,
-            TaskName  = parsed.GetOptional("task-name") ?? AgentInstaller.DefaultTaskName,
-            RunAsUser = parsed.GetOptional("user")      ?? "SYSTEM",
+            Root        = parsed.GetOptional("root")      ?? AgentInstaller.DefaultRoot,
+            TaskName    = parsed.GetOptional("task-name") ?? AgentInstaller.DefaultTaskName,
+            RunAsUser   = parsed.GetOptional("user")      ?? "SYSTEM",
+            AccountName = parsed.GetOptional("account")   ?? "deploysvc",
+            NoPrompt    = parsed.GetOptionalBool("no-prompt") ?? false,
             // A sub-minute interval is not expressible in Task Scheduler's repetition, and a
             // zero would register a task that never fires.
             IntervalMinutes = Math.Max(1,
@@ -498,7 +500,10 @@ internal class Program
               --root <path>        Agent root. Default C:\deploy (Windows), /var/lib/deploytool.
               --interval <minutes> Poll interval. Default 1.
               --task-name <name>   Scheduled task name. Default DeployAgent.
-              --user <account>     SYSTEM (default), LOCALSERVICE or NETWORKSERVICE.
+              --user <account>     Who the TASK runs as: SYSTEM (default), LOCALSERVICE, NETWORKSERVICE.
+              --account <name>     Local account the PRIMARY connects as. Default deploysvc;
+                                   install offers to create it and grant it the share.
+              --no-prompt          Skip that offer and print the commands instead.
 
           Diagnostics
             dytools-deploy hostname [--config <path>]   Which servers[] entry is this box?
