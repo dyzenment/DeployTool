@@ -282,7 +282,7 @@ A delivered run folder is entirely self-describing - `deploy-config.json` never 
   manifest.json          <- this peer's steps, plus notBeforeUtc
   DeployTool.exe         <- the binary that planned the run, so peer and primary cannot skew
   artifacts\
-    Web-folder\...       <- only what this peer's own steps reference
+    Web-release-win-x64\...   <- only what this peer's own steps reference
 ```
 
 Delivery happens **only after the primary's own apply succeeded**, so a broken build never
@@ -664,6 +664,12 @@ psexec -u .\deploysvc -p "<password>" cmd /c "dir \\10.0.1.20\deploy\incoming"
 | `targetFramework` | string | inferred | Target framework moniker to build. Required for multi-target projects. A .NET Framework TFM (e.g. `net481`) switches the build to `msbuild` instead of `dotnet publish`. |
 | `singleFile` | bool | `null` | Publish as a single file. |
 | `noWarn` | string | `null` | Comma-separated warning codes, passed as `/nowarn:`. |
+
+A project is published **once per distinct build block**, not once per target. Two targets whose
+`build` settings match (an omitted block counts as the defaults) share a single `dotnet publish`
+and a single artifact folder, named `artifacts/<Project>-<configuration>-<runtime>-<tfm>`; each
+target then applies from that folder. Change any build field on one target and it gets its own
+publish. The plan printed at the start of a run lists each publish and how many targets ride on it.
 
 ### IIS target
 

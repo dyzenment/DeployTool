@@ -28,7 +28,7 @@ public static class Planner
         CommitDirectives directives,
         string selectionReason)
     {
-        var targets   = BuildTargets(selectedProjects, config, handlers);
+        var (publishes, targets) = BuildTargets(selectedProjects, config, handlers);
         var allSteps  = targets.Select(t => t.Step).ToList();
         var peerSteps = targets.Where(t => t.Scope == DeployScope.Server)
                                .Select(t => t.Step)
@@ -53,54 +53,79 @@ public static class Planner
                 Projects = selectedProjects.Select(p => p.Name).ToList(),
                 Reason   = selectionReason
             },
+            Publishes   = publishes,
             Targets     = targets,
             ServerPlans = BuildServerPlans(config, selfHostname, directives, allSteps, peerSteps, globalSteps)
         };
     }
 
-    // -- Targets ---------------------------------------------------------------
+    // -- Targets and publishes -------------------------------------------------
 
-    private static List<TargetPlan> BuildTargets(
+    /// <summary>
+    /// Publishes are keyed by build variant, not by target. Every target in a project is
+    /// folded onto the first publish whose <see cref="BuildVariant.Key"/> matches, so a
+    /// project with an IIS target and a folder target on the same build compiles once and
+    /// applies twice. Targets that differ in any build field get their own publish.
+    /// </summary>
+    private static (List<PublishPlan>, List<TargetPlan>) BuildTargets(
         IReadOnlyList<DiscoveredProject> selectedProjects,
         DeployConfig config,
         IReadOnlyDictionary<DeployType, IDeployTypeHandler> handlers)
     {
+        var publishes = new List<PublishPlan>();
         var targets   = new List<TargetPlan>();
         var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var project in selectedProjects)
         {
+            // Per project, not per plan: the same build of two different projects is two builds.
+            var byVariant = new Dictionary<string, PublishPlan>(StringComparer.Ordinal);
+
             foreach (var target in project.Config!.Targets)
             {
                 if (!handlers.TryGetValue(target.Type, out var handler))
                     throw new InvalidOperationException(
                         $"Project '{project.Name}': no handler registered for deploy type '{target.Type}'.");
 
-                var relativePath = "artifacts/" + UniqueArtifactName(project, target, usedNames);
+                var key = BuildVariant.Key(target.Build);
+
+                if (!byVariant.TryGetValue(key, out var publish))
+                {
+                    publish = new PublishPlan
+                    {
+                        ProjectName          = project.Name,
+                        Build                = target.Build ?? new BuildConfig(),
+                        Label                = BuildVariant.Label(target.Build),
+                        ArtifactRelativePath = "artifacts/" + UniqueArtifactName(project, target.Build, usedNames)
+                    };
+                    byVariant[key] = publish;
+                    publishes.Add(publish);
+                }
 
                 targets.Add(new TargetPlan
                 {
                     ProjectName          = project.Name,
                     Target               = target,
-                    ArtifactRelativePath = relativePath,
+                    ArtifactRelativePath = publish.ArtifactRelativePath,
                     Scope                = handler.GetScope(target),
-                    Step                 = ApplyStepBuilder.Build(project, target, config, relativePath)
+                    Step                 = ApplyStepBuilder.Build(project, target, config, publish.ArtifactRelativePath)
                 });
             }
         }
 
-        return targets;
+        return (publishes, targets);
     }
 
     /// <summary>
-    /// "WebApp-iis", disambiguated to "WebApp-iis-2" if a project declares more than one
-    /// target of the same type. Uniqueness matters beyond tidiness: this path is the key
-    /// that pairs a publish with its apply step, so a collision would apply the wrong build.
+    /// "WebApp-release-win-x64", disambiguated to "WebApp-release-win-x64-2" when two variants
+    /// share a slug but not a key (a noWarn-only difference, say). Uniqueness matters beyond
+    /// tidiness: this path is the key that pairs a publish with its apply steps, so a
+    /// collision would apply the wrong build.
     /// </summary>
     private static string UniqueArtifactName(
-        DiscoveredProject project, TargetConfig target, HashSet<string> used)
+        DiscoveredProject project, BuildConfig? build, HashSet<string> used)
     {
-        var baseName = $"{project.Name}-{target.Type.ToString().ToLowerInvariant()}";
+        var baseName = $"{project.Name}-{BuildVariant.Slug(build)}";
         var name     = baseName;
         var counter  = 2;
 

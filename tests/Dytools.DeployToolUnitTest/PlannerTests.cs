@@ -24,17 +24,21 @@ public sealed class PlannerTests
 
     // -- Fixtures --------------------------------------------------------------
 
-    private static TargetConfig IisTarget(string path = @"C:\inetpub\Web") => new()
+    private static TargetConfig IisTarget(string path = @"C:\inetpub\Web", BuildConfig? build = null) => new()
     {
-        Type = DeployType.Iis,
-        Iis  = new IisConfig { SiteName = "MyWeb", DeployPath = path, AppPool = "MyWeb" }
+        Type  = DeployType.Iis,
+        Build = build,
+        Iis   = new IisConfig { SiteName = "MyWeb", DeployPath = path, AppPool = "MyWeb" }
     };
 
-    private static TargetConfig FolderTarget() => new()
+    private static TargetConfig FolderTarget(BuildConfig? build = null) => new()
     {
         Type   = DeployType.Folder,
+        Build  = build,
         Folder = new FolderConfig { DestinationPath = @"C:\Apps\Proc", ServiceName = "MyProc" }
     };
+
+    private static BuildConfig Build(string runtime) => new() { Runtime = runtime };
 
     private static TargetConfig VelopackTarget() => new()
     {
@@ -186,24 +190,155 @@ public sealed class PlannerTests
         var plan = Plan(Config(Web1, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
 
         var step = plan.Self.Steps.Single();
-        Assert.AreEqual("artifacts/WebApp-iis", step.Artifact);
+        Assert.AreEqual("artifacts/WebApp-release", step.Artifact);
         Assert.IsFalse(Path.IsPathRooted(step.Artifact),
             "an absolute path from the primary would be meaningless on a peer");
     }
 
     [TestMethod]
-    public void DuplicateTargetTypes_GetDistinctArtifactPaths()
+    public void EveryTarget_ConsumesExactlyOnePlannedPublish()
     {
-        // The artifact path is the key pairing a publish with its apply step - a collision
-        // would apply the wrong build.
+        var plan = Plan(Config(), "BOX",
+            Project("WebApp", IisTarget(), FolderTarget()),
+            Project("Admin", VelopackTarget()));
+
+        var publishPaths = plan.Publishes.Select(p => p.ArtifactRelativePath).ToList();
+        Assert.AreEqual(publishPaths.Count, publishPaths.Distinct().Count(),
+            "artifact paths are the publish/apply pairing key - they must be unique");
+
+        foreach (var target in plan.Targets)
+            Assert.AreEqual(1, plan.Publishes.Count(p => p.ArtifactRelativePath == target.ArtifactRelativePath),
+                $"{target.Step.Label} must map to one and only one publish");
+    }
+
+    // -- Publish dedupe --------------------------------------------------------
+
+    [TestMethod]
+    public void SameBuild_DifferentTypes_ShareOnePublish()
+    {
+        // The motivating case: an IIS target and a folder target with identical build blocks
+        // used to compile the project twice into two folders.
+        var plan = Plan(Config(), "BOX",
+            Project("WebApp", IisTarget(build: Build("win-x64")), FolderTarget(build: Build("win-x64"))));
+
+        Assert.AreEqual(1, plan.Publishes.Count);
+        Assert.AreEqual(2, plan.Targets.Count);
+
+        var artifact = plan.Publishes.Single().ArtifactRelativePath;
+        Assert.AreEqual("artifacts/WebApp-release-win-x64", artifact);
+        Assert.IsTrue(plan.Targets.All(t => t.ArtifactRelativePath == artifact));
+        Assert.IsTrue(plan.Self.Steps.All(s => s.Artifact == artifact),
+            "both apply steps must read the one shared artifact folder");
+    }
+
+    [TestMethod]
+    public void DuplicateTargetTypes_SameBuild_ShareOnePublish()
+    {
         var plan = Plan(Config(), "BOX",
             Project("WebApp", IisTarget(@"C:\inetpub\A"), IisTarget(@"C:\inetpub\B")));
 
-        var paths = plan.Targets.Select(t => t.ArtifactRelativePath).ToList();
-
-        CollectionAssert.AreEqual(new[] { "artifacts/WebApp-iis", "artifacts/WebApp-iis-2" }, paths);
-        Assert.AreEqual(paths.Count, paths.Distinct().Count());
+        Assert.AreEqual(1, plan.Publishes.Count);
+        Assert.AreEqual(2, plan.Self.Steps.Count, "one build, two sites");
     }
+
+    [TestMethod]
+    public void OmittedBuild_EqualsDefaultBuild()
+    {
+        // A target with no build block means "the default build", which is the same thing
+        // as spelling the defaults out - so the two must share.
+        var plan = Plan(Config(), "BOX",
+            Project("WebApp", IisTarget(build: null), FolderTarget(build: new BuildConfig())));
+
+        Assert.AreEqual(1, plan.Publishes.Count);
+        Assert.AreEqual("Release", plan.Publishes.Single().Label);
+    }
+
+    [TestMethod]
+    public void DifferentRuntime_GetsSeparatePublishes()
+    {
+        var plan = Plan(Config(), "BOX",
+            Project("WebApp", IisTarget(build: Build("win-x64")), FolderTarget(build: Build("linux-x64"))));
+
+        CollectionAssert.AreEqual(
+            new[] { "artifacts/WebApp-release-win-x64", "artifacts/WebApp-release-linux-x64" },
+            plan.Publishes.Select(p => p.ArtifactRelativePath).ToList());
+    }
+
+    [TestMethod]
+    public void EveryBuildField_ParticipatesInIdentity()
+    {
+        // Each row differs from the baseline in exactly one field and must not share with it.
+        var baseline = Build("win-x64");
+        var variants = new[]
+        {
+            new BuildConfig { Runtime = "win-x64", Configuration = "Debug" },
+            new BuildConfig { Runtime = "win-x64", TargetFramework = "net8.0" },
+            new BuildConfig { Runtime = "win-x64", SelfContained = true },
+            new BuildConfig { Runtime = "win-x64", SingleFile = true },
+            new BuildConfig { Runtime = "win-x64", NoWarn = "CS8600" }
+        };
+
+        foreach (var variant in variants)
+        {
+            var plan = Plan(Config(), "BOX",
+                Project("WebApp", IisTarget(build: baseline), FolderTarget(build: variant)));
+
+            Assert.AreEqual(2, plan.Publishes.Count,
+                $"a build differing only in {Describe(variant)} must get its own publish");
+        }
+    }
+
+    [TestMethod]
+    public void SameSlugDifferentKey_StillGetsDistinctPaths()
+    {
+        // noWarn is part of the identity but not the folder name, so this pair collides on
+        // the slug and must be disambiguated - a shared folder would apply the wrong build.
+        var plan = Plan(Config(), "BOX",
+            Project("WebApp",
+                IisTarget(build: Build("win-x64")),
+                FolderTarget(build: new BuildConfig { Runtime = "win-x64", NoWarn = "CS8600" })));
+
+        CollectionAssert.AreEqual(
+            new[] { "artifacts/WebApp-release-win-x64", "artifacts/WebApp-release-win-x64-2" },
+            plan.Publishes.Select(p => p.ArtifactRelativePath).ToList());
+    }
+
+    [TestMethod]
+    public void CaseAndOrder_DoNotSplitAPublish()
+    {
+        var plan = Plan(Config(), "BOX",
+            Project("WebApp",
+                IisTarget(build: new BuildConfig { Runtime = "win-x64", Configuration = "Release", NoWarn = "CS8600,CS8601" }),
+                FolderTarget(build: new BuildConfig { Runtime = "WIN-X64", Configuration = "release", NoWarn = "cs8601, CS8600" })));
+
+        Assert.AreEqual(1, plan.Publishes.Count);
+    }
+
+    [TestMethod]
+    public void SameBuild_DifferentProjects_NeverShare()
+    {
+        var plan = Plan(Config(), "BOX",
+            Project("WebApp", IisTarget(build: Build("win-x64"))),
+            Project("Processor", FolderTarget(build: Build("win-x64"))));
+
+        Assert.AreEqual(2, plan.Publishes.Count);
+    }
+
+    [TestMethod]
+    public void SharedPublish_TravelsToPeersOnce()
+    {
+        // Two peer steps on one artifact must still name the one folder - propagation
+        // copies distinct artifacts, so this is what keeps the payload from doubling.
+        var plan = Plan(Config(Web1, Web2), "WEBSERVER01",
+            Project("WebApp", IisTarget(), FolderTarget()));
+
+        var peer = plan.Peers.Single();
+        Assert.AreEqual(2, peer.Steps.Count);
+        Assert.AreEqual(1, peer.Steps.Select(s => s.Artifact).Distinct().Count());
+    }
+
+    private static string Describe(BuildConfig b) =>
+        $"configuration={b.Configuration} tfm={b.TargetFramework} sc={b.SelfContained} single={b.SingleFile} noWarn={b.NoWarn}";
 
     [TestMethod]
     public void TargetPlanArtifactPath_MatchesItsStepArtifactPath()
@@ -224,9 +359,9 @@ public sealed class PlannerTests
         var rebased = step.RebasedTo(Path.Combine("/staging", "run-1"));
 
         Assert.AreEqual(
-            Path.Combine("/staging", "run-1", "artifacts", "WebApp-iis"),
+            Path.Combine("/staging", "run-1", "artifacts", "WebApp-release"),
             rebased.Artifact);
-        Assert.AreEqual("artifacts/WebApp-iis", step.Artifact, "rebasing must not mutate the plan");
+        Assert.AreEqual("artifacts/WebApp-release", step.Artifact, "rebasing must not mutate the plan");
     }
 
     // -- Wait resolution -------------------------------------------------------

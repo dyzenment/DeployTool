@@ -34,9 +34,16 @@ public sealed class RolloutPlan
     public PlanSelection Selection { get; init; } = new();
 
     /// <summary>
-    /// The primary's ordered build+apply work. Each entry pairs the publish input
-    /// (TargetConfig, which carries the build config) with the apply input (ApplyStep).
-    /// ServerPlans are derived from this list - it is the single source.
+    /// The primary's publish work: one entry per distinct build variant per project, never
+    /// one per target. Two targets whose build blocks agree point at the same entry and the
+    /// same artifact folder, which is what stops "IIS + folder, same build" compiling twice.
+    /// </summary>
+    public List<PublishPlan> Publishes { get; init; } = [];
+
+    /// <summary>
+    /// The primary's ordered apply work. Each entry pairs the target with the ApplyStep it
+    /// produces and names the publish it consumes. ServerPlans are derived from this list -
+    /// it is the single source.
     /// </summary>
     public List<TargetPlan> Targets { get; init; } = [];
 
@@ -68,20 +75,40 @@ public sealed class PlanSelection
 }
 
 /// <summary>
-/// One target's work on the primary: publish it, then apply it.
-/// Pairs the two so they stay adjacent during execution.
+/// One build on the primary. Primary-only: a peer never builds, so this never travels -
+/// only the artifact folder it fills does.
+/// </summary>
+public sealed class PublishPlan
+{
+    public string ProjectName { get; init; } = string.Empty;
+
+    /// <summary>The build block this publish runs with. Never null; a missing block is the default build.</summary>
+    public BuildConfig Build { get; init; } = new();
+
+    /// <summary>"Release / win-x64 / net8.0" - for plan output and the report.</summary>
+    public string Label { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Where the output lands, relative to the run folder - e.g. "artifacts/WebApp-release-win-x64".
+    /// Unique within a plan, so it is the key that pairs this publish with every apply step
+    /// that consumes it, on the primary and after a manifest round-trip.
+    /// </summary>
+    public string ArtifactRelativePath { get; init; } = string.Empty;
+}
+
+/// <summary>
+/// One target's apply work on the primary, and which publish it waits on.
 /// </summary>
 public sealed class TargetPlan
 {
     public string ProjectName { get; init; } = string.Empty;
 
-    /// <summary>Publish input. Primary-only - a peer never builds, so this never travels.</summary>
+    /// <summary>The configured target. Primary-only; the resolved Step is what travels.</summary>
     public TargetConfig Target { get; init; } = new();
 
     /// <summary>
-    /// Where this target's output lands, relative to the run folder - e.g.
-    /// "artifacts/WebApp-iis". Unique within a plan, so it doubles as the key that pairs a
-    /// publish with its apply step after a manifest round-trip.
+    /// The publish this target applies from - always equal to Step.Artifact, and always the
+    /// ArtifactRelativePath of exactly one PublishPlan in the same RolloutPlan.
     /// </summary>
     public string ArtifactRelativePath { get; init; } = string.Empty;
 

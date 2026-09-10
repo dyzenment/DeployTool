@@ -99,7 +99,30 @@ public sealed class ProjectDeployResult
     /// </summary>
     public List<StepResult> TestResults { get; init; } = [];
 
+    /// <summary>
+    /// One entry per build variant the primary ran for this project - not per target. Two
+    /// targets on the same build share one entry here; a peer, which never builds, has none.
+    /// </summary>
+    public List<PublishResult> PublishResults { get; init; } = [];
+
     public List<TargetDeployResult> TargetResults { get; init; } = [];
+}
+
+/// <summary>The outcome of one build variant, and which targets were waiting on it.</summary>
+public sealed class PublishResult
+{
+    /// <summary>"Release / win-x64 / net8.0" - the variant, as the plan labelled it.</summary>
+    public string Label { get; init; } = string.Empty;
+
+    /// <summary>Artifact folder, relative to the run folder. Matches the consuming steps' artifact.</summary>
+    public string Artifact { get; init; } = string.Empty;
+
+    /// <summary>Labels of the targets that apply from this publish.</summary>
+    public List<string> Targets { get; init; } = [];
+
+    public StepResult Result { get; init; } = new();
+
+    public bool Success => Result.Success;
 }
 
 public sealed class TargetDeployResult
@@ -114,7 +137,6 @@ public sealed class TargetDeployResult
     public bool Success { get; set; }
     public string? ErrorMessage { get; set; }
     public bool RolledBack { get; set; }
-    public StepResult? PublishResult { get; set; }
     public List<StepResult> DeploySteps { get; init; } = [];
 }
 

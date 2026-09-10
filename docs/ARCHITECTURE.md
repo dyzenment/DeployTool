@@ -41,7 +41,7 @@ The primary copies *itself* to each peer. Version skew is impossible by construc
 
 ```
 Plan    → RolloutPlan            pure; shared
-Publish → artifacts/             primary only; peers arrive with this done
+Publish → artifacts/             primary only, once per build variant; peers arrive with this done
 Apply   → ApplyRunner            shared; identical executor, identical step objects
 ```
 
@@ -53,10 +53,11 @@ Program.cs  (mode switch - the ONLY role branch in the codebase)
 Shared below the seam:
   Planner                     → RolloutPlan
   ApplyRunner                 → executes ApplyStep[]
+  Planner                     → PublishPlan[] (one per project × build variant) + TargetPlan[]
+  BuildHelper.PublishAsync    → artifactDir      (full mode only; targets on the same build share one)
   IDeployTypeHandler
       .GetScope(target)       → Server | Global
-      .PublishAsync(...)      → artifactDir      (full mode only)
-      .ApplyAsync(artifactDir, IisConfig|FolderConfig)
+      .ApplyAsync(step)       → reads step.Artifact, never writes it
   DeployReport                → result.json      (both modes, same schema)
 ```
 
@@ -271,7 +272,7 @@ overrides).
     {
       "project": "WebApp",
       "type": "iis",
-      "artifact": "artifacts/WebApp-iis",     // relative to the run folder
+      "artifact": "artifacts/WebApp-release-win-x64",   // relative to the run folder
       "rollback": false,
       "iis": {
         "siteName": "MyWeb",
@@ -284,7 +285,7 @@ overrides).
     {
       "project": "Processor",
       "type": "folder",
-      "artifact": "artifacts/Processor-folder",
+      "artifact": "artifacts/Processor-release-win-x64",
       "rollback": true,
       "folder": {
         "destinationPath": "C:\\Apps\\Processor",

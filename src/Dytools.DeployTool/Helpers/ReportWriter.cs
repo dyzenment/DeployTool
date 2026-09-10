@@ -7,7 +7,7 @@ namespace Dytools.DeployTool.Helpers;
 /// Writes a run's DeployReport to result.json.
 ///
 /// One schema for both roles: a full primary run and a peer's apply run produce the same
-/// shape - a peer's simply has no pre-build/test entries and a null publishResult.
+/// shape - a peer's simply has no pre-build, test or publish entries.
 ///
 /// On a peer the file is also the idempotency marker. The agent polls every minute,
 /// forever, and "manifest present + no result.json" is what makes a run pending; writing
@@ -64,12 +64,10 @@ public static class ReportWriter
         {
             foreach (var step in project.PreBuildResults) yield return step;
             foreach (var step in project.TestResults)     yield return step;
+            foreach (var publish in project.PublishResults) yield return publish.Result;
 
             foreach (var target in project.TargetResults)
-            {
-                if (target.PublishResult is not null) yield return target.PublishResult;
                 foreach (var step in target.DeploySteps) yield return step;
-            }
         }
     }
 

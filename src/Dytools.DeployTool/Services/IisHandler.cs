@@ -73,7 +73,6 @@ public sealed class IisHandler : IDeployTypeHandler
         result.Success     = inner.Success;
         result.RolledBack  = inner.RolledBack;
         result.ErrorMessage = inner.ErrorMessage;
-        result.PublishResult = inner.PublishResult;
         result.DeploySteps.AddRange(inner.DeploySteps);
 
         if (LoadBalancerGate.ShouldRestore(inner, liveModified))

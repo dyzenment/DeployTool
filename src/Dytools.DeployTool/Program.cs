@@ -642,6 +642,17 @@ internal class Program
                 Console.WriteLine($"      {step.Project,-22} {step.Label}");
         }
 
+        // What this box will compile. One line per build variant, with how many targets
+        // ride on it - a "(2 targets)" is the dedupe doing its job, visible before any build.
+        Console.WriteLine("\n  Publishes (this server):");
+        foreach (var publish in plan.Publishes)
+        {
+            var consumers = plan.Targets.Count(t => t.ArtifactRelativePath == publish.ArtifactRelativePath);
+            Console.WriteLine(
+                $"      {publish.ProjectName,-22} {publish.Label,-32} → {publish.ArtifactRelativePath}  " +
+                $"({consumers} target{(consumers == 1 ? "" : "s")})");
+        }
+
         if (plan.HasPeers)
             Console.WriteLine(
                 $"\n  Peers apply {plan.WaitSeconds}s after this server succeeds " +
@@ -667,34 +678,66 @@ internal class Program
         Console.WriteLine("  -- Unit Tests -------------------------------------------");
         if (!await RunTestsAsync(project, registry, result, plan.SkipTests)) return result;
 
+        // -- Publish -----------------------------------------------------------
+        // One build per variant, not per target. The plan already folded every target with
+        // the same build block onto one PublishPlan, so "IIS + folder, same build" compiles
+        // once here and the two apply steps below read the same artifact folder. Identical
+        // for every deploy type, so it lives here rather than in a handler.
+        var publishes = plan.Publishes.Where(p => p.ProjectName == project.Name).ToList();
+        var targets   = plan.Targets.Where(t => t.ProjectName == project.Name).ToList();
+        var published = new Dictionary<string, PublishResult>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var publish in publishes)
+        {
+            var consumers = targets.Where(t => t.ArtifactRelativePath == publish.ArtifactRelativePath)
+                                   .Select(t => t.Step.Label)
+                                   .ToList();
+
+            Console.WriteLine($"\n  -- Publish: {publish.Label} -------------------------------");
+            Console.WriteLine($"     → {publish.ArtifactRelativePath}  ({consumers.Count} target(s))");
+
+            var artifactDir = Path.Combine(stagingRoot, publish.ArtifactRelativePath);
+            Directory.CreateDirectory(artifactDir);
+
+            var step = await BuildHelper.PublishAsync(
+                project.Name, project.Folder, publish.Build, artifactDir, project.NoWarn);
+
+            var publishResult = new PublishResult
+            {
+                Label    = publish.Label,
+                Artifact = publish.ArtifactRelativePath,
+                Targets  = consumers,
+                Result   = step
+            };
+            result.PublishResults.Add(publishResult);
+            published[publish.ArtifactRelativePath] = publishResult;
+
+            Console.WriteLine(step.Success
+                ? $"  ✓ Published in {step.Duration?.TotalSeconds:F1}s."
+                : "  ✗ Publish failed.");
+        }
+
         // -- Targets -----------------------------------------------------------
         // Sourced from the plan, not re-derived from config: the plan already decided what
         // this box does, and the same ApplyStep objects are what peers receive.
-        foreach (var targetPlan in plan.Targets.Where(t => t.ProjectName == project.Name))
+        foreach (var targetPlan in targets)
         {
             var target = targetPlan.Target;
-            var label  = $"{target.Type} / {target.Build?.Runtime ?? "default-rid"}";
-            Console.WriteLine($"\n  -- Target: {label} ----------------------------------");
+            Console.WriteLine($"\n  -- Target: {targetPlan.Step.Label} ----------------------------------");
 
-            var artifactDir = Path.Combine(stagingRoot, targetPlan.ArtifactRelativePath);
-            Directory.CreateDirectory(artifactDir);
-
-            // -- Publish -------------------------------------------------------
-            // Identical for every deploy type, so it lives here rather than in a handler.
-            var publishResult = await BuildHelper.PublishAsync(
-                project.Name, project.Folder, target.Build, artifactDir, project.NoWarn);
-
+            // A failed publish fails every target that was waiting on it, each with its own
+            // entry so the report still lists what did not go live.
+            var publishResult = published[targetPlan.ArtifactRelativePath];
             if (!publishResult.Success)
             {
                 result.TargetResults.Add(new TargetDeployResult
                 {
-                    TargetLabel   = targetPlan.Step.Label,
-                    Type          = target.Type,
-                    Success       = false,
-                    PublishResult = publishResult,
-                    ErrorMessage  = "dotnet publish failed."
+                    TargetLabel  = targetPlan.Step.Label,
+                    Type         = target.Type,
+                    Success      = false,
+                    ErrorMessage = $"Publish failed ({publishResult.Label}) - nothing to apply."
                 });
-                Console.WriteLine("  ✗ dotnet publish failed.");
+                Console.WriteLine("  ✗ Skipped - its publish failed.");
                 continue;
             }
 
@@ -706,10 +749,9 @@ internal class Program
             {
                 result.TargetResults.Add(new TargetDeployResult
                 {
-                    TargetLabel   = $"{targetPlan.Step.Label}  [built, not applied here]",
-                    Type          = target.Type,
-                    Success       = true,
-                    PublishResult = publishResult
+                    TargetLabel = $"{targetPlan.Step.Label}  [built, not applied here]",
+                    Type        = target.Type,
+                    Success     = true
                 });
                 Console.WriteLine("  – Built but not applied here (srv: excludes this server).");
                 continue;
@@ -719,15 +761,14 @@ internal class Program
             // a peer; rebasing resolves it against this box's staging folder.
             var targetResult = await handlers[target.Type]
                 .ApplyAsync(targetPlan.Step.RebasedTo(stagingRoot));
-            targetResult.PublishResult = publishResult;
             result.TargetResults.Add(targetResult);
 
             if (!targetResult.Success)
                 Console.WriteLine($"  ✗ {targetResult.ErrorMessage}");
             else
                 Console.WriteLine($"  ✓ Target complete in " +
-                    $"{targetResult.PublishResult?.Duration?.TotalSeconds:F1}s publish + " +
-                    $"{targetResult.DeploySteps.Sum(s => s.Duration?.TotalSeconds ?? 0):F1}s deploy.");
+                    $"{targetResult.DeploySteps.Sum(s => s.Duration?.TotalSeconds ?? 0):F1}s deploy " +
+                    $"(from {publishResult.Label}).");
         }
 
         return result;
@@ -981,6 +1022,9 @@ internal class Program
                 foreach (var t in failedTests)
                     Console.WriteLine($"          ✗ {t.StepName}");
             }
+
+            foreach (var p in proj.PublishResults.Where(p => !p.Success))
+                Console.WriteLine($"        ✗ Publish failed: {p.Label}");
 
             foreach (var t in proj.TargetResults)
             {
