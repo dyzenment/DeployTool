@@ -195,6 +195,10 @@
           "type": "integer",
           "description": "Run folders retained per peer before the oldest are pruned.",
           "format": "int32"
+        },
+        "precheckPeers": {
+          "type": "boolean",
+          "description": "Prove every peer is reachable and writable before building, and abort the run if one is\nnot. On by default: propagation is the last thing a run does, so without it an\nunreachable peer costs the whole build and test cycle to discover.\n            \nTurn it off only if you would rather a peer that is down not block a deploy to the boxes\nthat are up - the run will still fail at propagation, just later."
         }
       }
     },

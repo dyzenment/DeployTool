@@ -204,6 +204,17 @@ public sealed class RolloutConfig
     /// <summary>Run folders retained per peer before the oldest are pruned.</summary>
     [JsonPropertyName("keepRuns")]
     public int KeepRuns { get; set; } = 5;
+
+    /// <summary>
+    /// Prove every peer is reachable and writable before building, and abort the run if one is
+    /// not. On by default: propagation is the last thing a run does, so without it an
+    /// unreachable peer costs the whole build and test cycle to discover.
+    ///
+    /// Turn it off only if you would rather a peer that is down not block a deploy to the boxes
+    /// that are up - the run will still fail at propagation, just later.
+    /// </summary>
+    [JsonPropertyName("precheckPeers")]
+    public bool PrecheckPeers { get; set; } = true;
 }
 
 // -----------------------------------------------------------------------------

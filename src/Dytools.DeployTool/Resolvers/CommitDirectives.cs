@@ -12,6 +12,9 @@ namespace Dytools.DeployTool.Resolvers;
 ///   pub:*           publish everything
 ///   pub:none        publish nothing - no project is named "none", so it simply matches
 ///                   nothing. Deliberately not a special case.
+///   srv:S2          roll out to these servers only (pipe-separated globs over servers[])
+///   srv:web*        same, by glob
+///   srv:*           every server - the default when no srv: is given
 ///   wait:0          override the rollout soak delay, in seconds
 ///   wait:60         wait 60 seconds before peers receive the build
 ///   skiptests       deploy without running the unit-test gate
@@ -24,6 +27,12 @@ public sealed class CommitDirectives
 {
     /// <summary>Name globs from a pub: directive. Null when the commit carries no pub:.</summary>
     public IReadOnlyList<string>? PubPatterns { get; init; }
+
+    /// <summary>
+    /// Server globs from an srv: directive. Null when the commit carries no srv:, which means
+    /// every server - so absence and "srv:*" behave the same, and nobody has to write it.
+    /// </summary>
+    public IReadOnlyList<string>? SrvPatterns { get; init; }
 
     /// <summary>Seconds from a wait: directive. Null when the commit carries no wait:.</summary>
     public int? WaitSeconds { get; init; }
@@ -38,11 +47,18 @@ public sealed class CommitDirectives
     /// <summary>True when the commit explicitly stated what to publish.</summary>
     public bool HasPub => PubPatterns is not null;
 
+    /// <summary>True when the commit explicitly narrowed which servers take part.</summary>
+    public bool HasSrv => SrvPatterns is not null;
+
     public static readonly CommitDirectives None = new();
 
     // pub: runs to the next whitespace, so it works anywhere in a multi-line message.
     private static readonly Regex PubRegex =
         new(@"\bpub:(\S+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // Same shape as pub:, deliberately - one syntax to remember for both.
+    private static readonly Regex SrvRegex =
+        new(@"\bsrv:(\S+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     private static readonly Regex WaitRegex =
         new(@"\bwait:(\d+)\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -59,6 +75,7 @@ public sealed class CommitDirectives
         if (string.IsNullOrWhiteSpace(commitMessage)) return None;
 
         var pubMatch  = PubRegex.Match(commitMessage);
+        var srvMatch  = SrvRegex.Match(commitMessage);
         var waitMatch = WaitRegex.Match(commitMessage);
         var skipMatch = SkipTestsRegex.Match(commitMessage);
 
@@ -79,6 +96,7 @@ public sealed class CommitDirectives
         return new CommitDirectives
         {
             PubPatterns = patterns,
+            SrvPatterns = srvMatch.Success ? SplitPubPatterns(srvMatch.Groups[1].Value) : null,
             WaitSeconds = waitSeconds,
             SkipTests   = skipTests
         };
@@ -90,10 +108,12 @@ public sealed class CommitDirectives
     /// so it overlays cleanly. <paramref name="pubRaw"/> uses the same pipe-separated glob
     /// syntax as pub: ("Web|Proc*", "*", "none").
     /// </summary>
-    public static CommitDirectives FromValues(string? pubRaw, int? waitSeconds, bool? skipTests = null)
+    public static CommitDirectives FromValues(
+        string? pubRaw, int? waitSeconds, bool? skipTests = null, string? srvRaw = null)
         => new()
         {
             PubPatterns = pubRaw is null ? null : SplitPubPatterns(pubRaw),
+            SrvPatterns = srvRaw is null ? null : SplitPubPatterns(srvRaw),
             WaitSeconds = waitSeconds,
             SkipTests   = skipTests
         };
@@ -108,6 +128,7 @@ public sealed class CommitDirectives
         => new()
         {
             PubPatterns = overrides.PubPatterns ?? PubPatterns,
+            SrvPatterns = overrides.SrvPatterns ?? SrvPatterns,
             WaitSeconds = overrides.WaitSeconds ?? WaitSeconds,
             SkipTests   = overrides.SkipTests   ?? SkipTests
         };
@@ -122,6 +143,18 @@ public sealed class CommitDirectives
     /// </summary>
     public bool MatchesPub(string projectName)
         => PubPatterns is not null && PubPatterns.Any(p => GlobMatches(projectName, p));
+
+    /// <summary>
+    /// True if a server takes part in this run. No srv: directive means every server does, so
+    /// the common case needs no directive at all.
+    ///
+    /// Matches the servers[] label or the hostname, because both appear in the output people
+    /// read before writing the directive and neither is more obviously "the name".
+    /// </summary>
+    public bool MatchesSrv(string serverName, string? hostname = null)
+        => SrvPatterns is null
+        || SrvPatterns.Any(p => GlobMatches(serverName, p)
+                             || (hostname is not null && GlobMatches(hostname, p)));
 
     /// <summary>Translates a shell-style glob into an anchored regex match.</summary>
     private static bool GlobMatches(string name, string pattern)

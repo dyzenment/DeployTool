@@ -185,13 +185,26 @@ public sealed class NetworkShare : IDisposable
 
         var expanded = FileHelper.ExpandEnvVars(rawPassword);
 
-        if (isReference && LooksLikeEnvReference(expanded))
+        // Two ways an environment reference fails to produce a password, and they look nothing
+        // alike from here. An ABSENT variable survives expansion unchanged, so "%FOO%" comes back
+        // as "%FOO%". A variable that is present but EMPTY expands cleanly to "" - which is what
+        // GitHub Actions produces when `${ secrets.X }` names a secret that does not exist, or
+        // an environment secret a job without an `environment:` key cannot see. That second case
+        // is the dangerous one: it looks like success and authenticates with a blank password.
+        if (isReference && (LooksLikeEnvReference(expanded) || expanded.Length == 0))
             throw new DeployException(
-                $"The peer password references an environment variable that is not set ({rawPassword}). " +
-                "Set it on the runner, or pass it through the workflow's env: block.");
+                $"The peer password references {rawPassword}, which resolved to nothing. " +
+                "On a GitHub runner this almost always means the secret does not exist, or it is " +
+                "an ENVIRONMENT secret - those are invisible to a job that does not declare " +
+                "`environment:`, and expand to an empty string rather than failing. Create it " +
+                "under Settings -> Secrets and variables -> Actions -> Repository secrets, and " +
+                "check the job log shows a value (masked as ***) rather than a blank.");
 
         return expanded;
     }
+
+    /// <summary>Server name out of a share root, for diagnostics that name a host to test.</summary>
+    private static string HostOf(string shareRoot) => shareRoot[2..].Split('\\')[0];
 
     private static bool LooksLikeEnvReference(string value)
         => Regex.IsMatch(value, @"%[A-Z_][A-Z0-9_]*%|\$\{?[A-Z_][A-Z0-9_]*\}?",
@@ -218,9 +231,19 @@ public sealed class NetworkShare : IDisposable
             "is a security-group rule), and that the name resolves - a Windows computer name " +
             "will not resolve across VPC subnets, so use the private IP.",
 
+        // 67 and 53 overlap in practice: Windows reports "bad net name" both for a share that
+        // is missing and for a host it could not resolve at all. Saying only the former sends
+        // people to re-create a share that already exists.
         ErrorBadNetName =>
-            $"{root} does not exist on that host. Create it with: " +
-            @"net share deploy=C:\deploy /grant:<user>,CHANGE",
+            $"Could not reach {root}. Either the share does not exist on that host, or the host " +
+            "name did not resolve from here. Check, in this order, from THIS box:\n" +
+            $"      Resolve-DnsName {HostOf(root)}          - a Windows computer name only resolves\n" +
+            "                                        by broadcast within one subnet; across VPC\n" +
+            "                                        subnets use the private IP in incomingShare\n" +
+            $"      Test-NetConnection {HostOf(root)} -Port 445\n" +
+            $"      net view \\\\{HostOf(root)}                - lists its shares\n" +
+            "    If the share really is missing, create it on that host with: " +
+            @"net share deploy=C:\deploy /grant:deploysvc,CHANGE",
 
         ErrorSessionCredentialConflict =>
             $"Another session to that server is already open with different credentials, and " +

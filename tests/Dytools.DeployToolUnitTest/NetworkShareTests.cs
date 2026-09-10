@@ -98,7 +98,7 @@ public sealed class NetworkShareTests
         var ex = Assert.ThrowsException<DeployException>(
             () => NetworkShare.ResolvePassword("%DEPLOYTOOL_TEST_UNSET_PW%"));
 
-        StringAssert.Contains(ex.Message, "not set");
+        StringAssert.Contains(ex.Message, "resolved to nothing");
 
         // Names the variable so the fix is obvious, and it is only ever a variable name.
         StringAssert.Contains(ex.Message, "DEPLOYTOOL_TEST_UNSET_PW");
@@ -138,6 +138,29 @@ public sealed class NetworkShareTests
         }
 
         StringAssert.Contains(console.ToString(), "%DEPLOY_SHARE_PASSWORD%");
+    }
+
+    [TestMethod]
+    public void AnEnvironmentVariableSetToEmptyIsAlsoAnError()
+    {
+        // The GitHub Actions case: `${ secrets.X }` for a secret that does not exist - or an
+        // environment secret a job cannot see - expands to an EMPTY STRING, not to nothing.
+        // The variable is therefore present, expansion succeeds, and without this check the
+        // deploy would authenticate with a blank password and blame the peer.
+        try
+        {
+            Environment.SetEnvironmentVariable("DEPLOYTOOL_TEST_EMPTY_PW", string.Empty);
+
+            var ex = Assert.ThrowsException<DeployException>(
+                () => NetworkShare.ResolvePassword("%DEPLOYTOOL_TEST_EMPTY_PW%"));
+
+            StringAssert.Contains(ex.Message, "resolved to nothing");
+            StringAssert.Contains(ex.Message, "ENVIRONMENT secret");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DEPLOYTOOL_TEST_EMPTY_PW", null);
+        }
     }
 
     [TestMethod]

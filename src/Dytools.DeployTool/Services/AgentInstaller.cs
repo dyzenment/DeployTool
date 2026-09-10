@@ -25,6 +25,12 @@ public static class AgentInstaller
     private const long LogRollBytes = 5 * 1024 * 1024;
 
     /// <summary>
+    /// The workflow expression that pulls the secret out of GitHub. Held as a constant because
+    /// its braces cannot be written inline in the interpolated raw strings below.
+    /// </summary>
+    private const string SecretExpression = "${{ secrets.DEPLOY_SHARE_PASSWORD }}";
+
+    /// <summary>
     /// Accounts the task can run as without a password. Anything else has to be registered by
     /// hand: a deploy tool must never be in the business of collecting credentials, and there
     /// is no way to pass one to schtasks that does not put it on a command line.
@@ -370,52 +376,60 @@ public static class AgentInstaller
     // -- Closing summary -------------------------------------------------------
 
     /// <summary>
-    /// Ends on everything the operator has to do next, with this box's real names already
-    /// substituted in.
+    /// What to do next, and only what is still outstanding.
     ///
-    /// Long on purpose. Standing a peer up is two-thirds a Windows permissions job, the
-    /// permissions half happens in a different place from the config half, and the failure when
-    /// it is wrong is a flat "access denied" hours later in a CI log nobody is watching. Saying
-    /// it here, at the one moment someone is definitely looking at this box, is worth the lines.
+    /// Adaptive on purpose. An earlier version printed every option in full every time, which
+    /// ran to eighty lines and buried the three things that actually remained. Once the account
+    /// exists and the share is granted, none of the how-to-create-it text is worth reading.
     /// </summary>
     private static void PrintNextSteps(AgentLayout layout, bool scheduled, AgentOptions options)
     {
         var host      = HostIdentity.Resolve();
-        // Empty only for a volume root ("C:\"), which nobody should be sharing wholesale -
-        // fall back to a sane name rather than emitting `net share =C:\`.
         var shareName = Path.GetFileName(layout.Root) is { Length: > 0 } n ? n : "deploy";
-        var unc       = OperatingSystem.IsWindows()
-            ? $@"\\{host}\{shareName}\{AgentLayout.IncomingFolderName}"
-            : layout.Incoming;
+        var addresses = LocalAddresses();
 
         Console.WriteLine();
         Console.WriteLine("═══════════════════════════════════════════════════════════════");
         Console.WriteLine(scheduled
             ? "  ✓ This box will now poll for rollouts every minute."
-            : "  ! Folders and poll script are ready - but nothing is scheduled to run them yet (see above).");
+            : "  ! Folders and poll script are ready - nothing is scheduled to run them yet (see above).");
         Console.WriteLine("═══════════════════════════════════════════════════════════════");
 
         if (!OperatingSystem.IsWindows())
         {
-            PrintServersEntry(host, unc, options.AccountName, provisioned: false);
-            Console.WriteLine($"\n  Watch it work:  {layout.LogFile}\n");
+            PrintServersEntry(host, layout, addresses, options.AccountName, credentials: false);
+            Console.WriteLine($"  Watch it work:  {layout.LogFile}\n");
             return;
         }
 
-        // Identity first. Granting comes second because you cannot grant to an account that
-        // does not exist yet - net share fails with "no mapping between account names and
-        // security IDs", which reads like a broken command rather than a missing step.
-        PrintIdentityStep(host, unc, layout);
+        PrintWhyAnAccount();
 
-        // Offer to just do it. Everything in steps 1 and 2 is mechanical and happens on this
-        // box; only the primary-side choice below genuinely needs a human.
         var provisioned = TryProvision(layout, shareName, options);
 
-        if (!provisioned) PrintShareStep(layout, shareName);
+        if (!provisioned) PrintManualCommands(layout, shareName, options.AccountName);
 
-        PrintServersEntry(host, unc, options.AccountName, provisioned);
-        PrintChecklist(host, unc, layout, options.AccountName);
+        Console.WriteLine("\n  ── What is left, all on the primary ──────────────────────────");
+
+        PrintServersEntry(host, layout, addresses, options.AccountName, credentials: true);
+        PrintSecretStep(options.AccountName);
+        PrintVerifyStep(layout, addresses, shareName);
+
+        Console.WriteLine();
+        Console.WriteLine("  Prefer mirrored local accounts and no secret? That works too - create the");
+        Console.WriteLine("  same username and password on the primary and repoint its runner service");
+        Console.WriteLine("  at it, then drop username/password from the config. See the README.");
+        Console.WriteLine();
+        Console.WriteLine($"  Log:   {layout.LogFile}");
+        Console.WriteLine("  Docs:  https://github.com/dyzenment/DeployTool#reaching-a-peers-share");
+        Console.WriteLine();
     }
+
+    private static void PrintWhyAnAccount() => Console.WriteLine("""
+
+          The primary needs a local account here to connect as. Its runner service
+          authenticates over the network as a machine account, which a peer with no
+          domain controller cannot resolve - so granting that account gets you nowhere.
+        """);
 
     // -- Doing it, rather than printing it -------------------------------------
 
@@ -529,167 +543,125 @@ public static class AgentInstaller
         return true;
     }
 
-    // -- Step 2: the share -----------------------------------------------------
+    // -- Printed only when the offer was declined -------------------------------
 
-    private static void PrintShareStep(AgentLayout layout, string shareName)
-    {
-        // icacls is quoted because these get pasted into PowerShell as often as cmd, and
-        // PowerShell reads a bare (OI)(CI) as a subexpression to evaluate. Quoted works in both.
-        Console.WriteLine($"""
+    private static void PrintManualCommands(AgentLayout layout, string shareName, string account)
+        => Console.WriteLine($"""
 
-          ── 2. Share this folder and grant that account ───────────────
+          Run these here, elevated. Read-Host keeps the password out of your history,
+          and the quotes on icacls are required in PowerShell:
 
-          Here, elevated, once the account from step 1 exists:
+              New-LocalUser -Name {account} -PasswordNeverExpires `
+                -Password (Read-Host -AsSecureString "Password for {account}")
+              net share {shareName}={layout.Root} /grant:{account},CHANGE
+              icacls {layout.Root} /grant "{account}:(OI)(CI)M"
 
-              net share {shareName}={layout.Root} /grant:deploysvc,CHANGE
-              icacls {layout.Root} /grant "deploysvc:(OI)(CI)M"
-
-          Both are needed - the share permission and the NTFS permission are separate
-          gates, and the stricter of the two wins. The quotes on icacls matter in
-          PowerShell; without them it tries to evaluate (OI) as a command.
-
-          Grant on {layout.Root}, NOT on {layout.Incoming}. The primary copies into
-          {AgentLayout.StagingFolderName}\<runId> and then moves it across into
-          {AgentLayout.IncomingFolderName}\<runId> - that move is what makes the handoff
-          atomic - and it prunes old runs afterwards. It needs write and delete on both
-          folders, which Modify on the root covers.
+          Grant on {layout.Root}, not on incoming - propagation stages beside incoming
+          and moves across, and prunes old runs. Modify on the root covers all of it.
         """);
+
+    // -- The three remaining steps ----------------------------------------------
+
+    private static void PrintServersEntry(
+        string host, AgentLayout layout, IReadOnlyList<string> addresses, string account, bool credentials)
+    {
+        // The private IP, not the computer name. A VPC carries no broadcast traffic, so NetBIOS
+        // name resolution never works between instances - and the SMB error for it (67) reads
+        // as a missing share, which sends people to re-create one that already exists.
+        var target = addresses.Count > 0 ? addresses[0] : host;
+
+        var unc = OperatingSystem.IsWindows()
+            ? $@"\\{target}\{Path.GetFileName(layout.Root)}\{AgentLayout.IncomingFolderName}".Replace("\\", "\\\\")
+            : layout.Incoming;
+
+        Console.WriteLine($$"""
+
+          1. Add to servers[] in deploy-config.json:
+
+               {
+                 "name": "{{host.ToLowerInvariant()}}",
+                 "hostname": "{{host}}",
+                 "incomingShare": "{{unc}}"{{(credentials ? "," : "")}}
+        """);
+
+        if (credentials)
+            Console.WriteLine($$"""
+                     "username": "{{host}}\\{{account}}",
+                     "password": "%DEPLOY_SHARE_PASSWORD%"
+            """);
+
+        Console.WriteLine("       }");
+
+        if (OperatingSystem.IsWindows())
+        {
+            Console.WriteLine();
+            Console.WriteLine(addresses.Count > 0
+                ? $"     Addresses on this box: {string.Join(", ", addresses)}"
+                : "     (could not read this box's addresses - use its private IP)");
+            Console.WriteLine("     Use the IP, not the name. A VPC carries no broadcast, so a Windows computer");
+            Console.WriteLine("     name will not resolve between instances. hostname stays the computer name -");
+            Console.WriteLine("     that is resolved locally and never goes over the wire.");
+        }
     }
 
-    // -- Step 1: identity ------------------------------------------------------
+    private static void PrintSecretStep(string account) => Console.WriteLine($$"""
+
+          2. Store the {{account}} password as a GitHub secret, in the APPLICATION repo:
+
+               Settings -> Secrets and variables -> Actions -> Repository secrets
+               (NOT Environment secrets - those are invisible to a job with no
+                `environment:` key and expand to an empty string)
+
+                 Name   DEPLOY_SHARE_PASSWORD
+                 Secret the password
+
+             Then pass it to the deploy step:
+
+                 env:
+                   DEPLOY_SHARE_PASSWORD: {{SecretExpression}}
+        """);
+
+    private static void PrintVerifyStep(AgentLayout layout, IReadOnlyList<string> addresses, string shareName)
+    {
+        var target = addresses.Count > 0 ? addresses[0] : HostIdentity.Resolve();
+
+        Console.WriteLine($"""
+
+          3. From the primary, confirm it can get here:
+
+                 Test-NetConnection {target} -Port 445
+                 dytools-deploy test-peers --config deploy-config.json
+
+             The first proves the route and the security group - on EC2 or Azure that
+             is an inbound tcp/445 rule, not the Windows firewall. The second runs the
+             same checks a deploy does: resolve, connect, authenticate, write.
+        """);
+    }
 
     /// <summary>
-    /// The part that actually bites. A self-hosted Actions runner installs as a service running
-    /// as NETWORK SERVICE, which authenticates over the network as the machine account - a name
-    /// a workgroup peer cannot resolve, so every copy fails no matter what step 1 granted.
+    /// This box's own IPv4 addresses, so the entry above can be pasted with a working target
+    /// rather than a name that will not resolve.
     /// </summary>
-    private static void PrintIdentityStep(string host, string unc, AgentLayout layout)
+    private static List<string> LocalAddresses()
     {
-        // On a workgroup box USERDOMAIN is the computer name. A heuristic, so it is phrased as
-        // one - but it decides which of the two options is even relevant.
-        var looksDomainJoined = !string.Equals(
-            Environment.UserDomainName, Environment.MachineName, StringComparison.OrdinalIgnoreCase);
-
-        Console.WriteLine("""
-
-          ── 2. Give the primary an identity this box will accept ──────
-        """);
-
-        if (looksDomainJoined)
+        try
         {
-            Console.WriteLine($"""
-
-              This box appears to be domain-joined ({Environment.UserDomainName}), so this is
-              easy: grant the primary's runner account in step 1 and you are done. If the runner
-              runs as NETWORK SERVICE, its network identity is the machine account - grant
-              DOMAIN\PRIMARYNAME$ rather than a user.
-
-              If that is wrong and you are actually in a workgroup, use one of the options below.
-              """);
+            return System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                .Where(nic => nic.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up
+                           && nic.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
+                .SelectMany(nic => nic.GetIPProperties().UnicastAddresses)
+                .Select(addr => addr.Address)
+                .Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                          && !System.Net.IPAddress.IsLoopback(ip))
+                .Select(ip => ip.ToString())
+                .Distinct()
+                .ToList();
         }
-
-        Console.WriteLine($$"""
-
-          A self-hosted Actions runner installs as a service running as NETWORK SERVICE.
-          Over the network that authenticates as the MACHINE account - PRIMARY$ - which a
-          workgroup peer has no way to resolve. Granting it in step 1 will not help; you
-          need one of these.
-
-          Option A - dedicated account here, credentials in deploy-config.json
-                     (changes nothing about the runner - start here)
-
-            On this box only, elevated. Read-Host keeps the password out of your
-            shell history:
-
-                New-LocalUser -Name deploysvc -PasswordNeverExpires \
-                  -Password (Read-Host -AsSecureString "Password for deploysvc")
-
-            It needs nothing beyond the share - no interactive logon, so not an
-            administrator. Then add to its servers[] entry:
-
-                "username": "{{host}}\\deploysvc",
-                "password": "%DEPLOY_SHARE_PASSWORD%"
-
-            Set DEPLOY_SHARE_PASSWORD from a CI secret - the tool refuses to run if the
-            variable is missing, and warns every time if you paste the password literally.
-            The account needs no rights beyond the share; it never logs on interactively.
-
-          Option B - mirrored local account
-                     (nothing in the config, but the runner must be reconfigured)
-
-            Create the SAME username with the SAME password on BOTH boxes:
-
-                New-LocalUser -Name deploysvc -PasswordNeverExpires \
-                  -Password (Read-Host -AsSecureString "Password for deploysvc")
-
-            Then on the primary, point the runner service at it:
-            Services -> actions.runner.* -> Log On -> .\deploysvc -> restart.
-
-            Workgroup pass-through does the rest: the peer validates the incoming
-            credentials against its own SAM and lets it in. Step 2 grants it the share.
-            Keeping the two passwords in step forever is the cost.
-        """);
+        catch
+        {
+            return [];
+        }
     }
-
-    // -- Step 3: config --------------------------------------------------------
-
-    private static void PrintServersEntry(string host, string unc, string account, bool provisioned)
-    {
-        // The share path is written with the machine name, which is right on a flat LAN and
-        // wrong the moment the two boxes are in different VPC subnets - see the checklist.
-        Console.WriteLine($$"""
-
-          ── 3. Add it to servers[] in your deploy-config.json ─────────
-
-              {
-                "name": "{{host.ToLowerInvariant()}}",
-                "hostname": "{{host}}",
-                "incomingShare": "{{unc.Replace("\\", "\\\\")}}"
-              }
-
-          hostname is how this box recognises itself, and stays the computer name.
-          incomingShare only has to be reachable FROM the primary.
-        """);
-
-        if (provisioned)
-            Console.WriteLine($$"""
-              For Option A, add the credential to that entry too:
-
-                  "username": "{{host}}\{{account}}",
-                  "password": "%DEPLOY_SHARE_PASSWORD%"
-
-              and set DEPLOY_SHARE_PASSWORD from a CI secret in the workflow's env: block.
-            """);
-    }
-
-    // -- Closing checklist -----------------------------------------------------
-
-    private static void PrintChecklist(string host, string unc, AgentLayout layout, string account)
-    {
-        Console.WriteLine($"""
-
-          ── Before the first rollout ──────────────────────────────────
-
-            • TCP 445 must be open from the primary to this box. On EC2 or Azure that is a
-              security-group / NSG rule, not just the Windows firewall.
-
-            • '{host}' may not resolve from the primary. A Windows computer name only
-              resolves by broadcast within one subnet, so across VPC subnets you want the
-              private IP in incomingShare instead:  \\10.0.0.0\{Path.GetFileName(layout.Root)}\{AgentLayout.IncomingFolderName}
-
-            • Verify AS THE RUNNER'S ACCOUNT, not your own login - that is the mistake that
-              makes this look fixed when it is not:
-
-                  psexec -u .\{account} -p "<password>" cmd /c "dir {unc}"
-
-            • Then run 'dytools-deploy hostname --config deploy-config.json' on each box and
-              confirm each one matches its own entry.
-
-          Watch it work:  {layout.LogFile}
-
-        """);
-    }
-
 }
 
 /// <summary>Where everything an agent owns lives, derived from one root.</summary>

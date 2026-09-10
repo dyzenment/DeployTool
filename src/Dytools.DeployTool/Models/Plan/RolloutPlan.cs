@@ -44,8 +44,18 @@ public sealed class RolloutPlan
     public List<ServerPlan> ServerPlans { get; init; } = [];
 
     public ServerPlan Self => ServerPlans.First(s => s.IsSelf);
+
+    /// <summary>Every other configured server, whether or not this run touches it.</summary>
     public IEnumerable<ServerPlan> Peers => ServerPlans.Where(s => !s.IsSelf);
-    public bool HasPeers => ServerPlans.Any(s => !s.IsSelf);
+
+    /// <summary>
+    /// The peers this run actually ships to - Peers minus anything an srv: directive excluded.
+    /// This is what propagation and the precheck work from; Peers is only for display, so an
+    /// excluded box still appears in the plan rather than silently vanishing.
+    /// </summary>
+    public IEnumerable<ServerPlan> SelectedPeers => Peers.Where(s => s.Selected);
+
+    public bool HasPeers => SelectedPeers.Any();
 }
 
 /// <summary>What was chosen to deploy, and why. Recorded for the audit trail.</summary>
@@ -89,6 +99,13 @@ public sealed class ServerPlan
 
     /// <summary>True for the box running this deploy - it applies inline from staging.</summary>
     public bool IsSelf { get; init; }
+
+    /// <summary>
+    /// Whether this run touches this server at all. False only when an srv: directive excluded
+    /// it. Kept alongside the (then empty) step list so the plan can say "excluded" rather than
+    /// "nothing to do", which are different things and fail differently.
+    /// </summary>
+    public bool Selected { get; init; } = true;
 
     /// <summary>Where to drop this peer's run folder. Null for self.</summary>
     public string? IncomingShare { get; init; }

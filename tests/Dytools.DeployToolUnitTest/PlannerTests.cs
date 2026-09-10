@@ -290,4 +290,100 @@ public sealed class PlannerTests
         Assert.AreEqual(0, plan.Self.Steps.Count);
         Assert.AreEqual(0, plan.Peers.Single().Steps.Count);
     }
+
+    // -- srv: server selection --------------------------------------------------
+
+    [TestMethod]
+    public void SrvNarrowsWhichPeersReceiveTheRun()
+    {
+        var config = FleetConfig();
+        var plan   = PlanWith(config, "WEB01", CommitDirectives.Parse("srv:web02"));
+
+        Assert.IsTrue(plan.ServerPlans.Single(s => s.ServerName == "web02").Selected);
+        Assert.IsFalse(plan.ServerPlans.Single(s => s.ServerName == "web03").Selected);
+
+        // Excluded boxes stay in the plan so the output can say "excluded" rather than
+        // silently dropping a server someone expected to see.
+        Assert.AreEqual(3, plan.ServerPlans.Count);
+        Assert.AreEqual(1, plan.SelectedPeers.Count());
+        Assert.AreEqual(0, plan.ServerPlans.Single(s => s.ServerName == "web03").Steps.Count);
+    }
+
+    [TestMethod]
+    public void ExcludingThePrimaryStillBuildsButAppliesNothingLocally()
+    {
+        // "roll this out to web02 only" - the primary is the only box that can build, so it
+        // still does, but nothing goes live here.
+        var config = FleetConfig();
+        var plan   = PlanWith(config, "WEB01", CommitDirectives.Parse("srv:web02"));
+
+        Assert.IsFalse(plan.Self.Selected);
+        Assert.AreEqual(0, plan.Self.Steps.Count);
+
+        // The targets are still planned - that is the publish work the peer's payload needs.
+        Assert.AreNotEqual(0, plan.Targets.Count);
+        Assert.AreNotEqual(0, plan.SelectedPeers.Single().Steps.Count);
+    }
+
+    [TestMethod]
+    public void AnExcludedPrimaryKeepsItsGlobalSteps()
+    {
+        // A Velopack upload is not something done "to a server", so narrowing the rollout to
+        // one box must not also cancel the package publish.
+        var config = FleetConfig();
+        config.Projects.Add(new ProjectConfig { Name = "Admin", Targets = { VelopackTarget() } });
+
+        var projects = new[] { Project("Web", IisTarget()), Project("Admin", VelopackTarget()) };
+        var plan = Planner.Plan("run", "sha", projects, config, Handlers, "WEB01",
+            CommitDirectives.Parse("srv:web02"), "test");
+
+        Assert.IsFalse(plan.Self.Selected);
+        Assert.AreEqual(1, plan.Self.Steps.Count);
+        Assert.AreEqual(DeployType.Velopack, plan.Self.Steps.Single().Type);
+    }
+
+    [TestMethod]
+    public void NoSrvDirectiveSelectsEveryServer()
+    {
+        var plan = PlanWith(FleetConfig(), "WEB01", CommitDirectives.None);
+
+        Assert.IsTrue(plan.ServerPlans.All(s => s.Selected));
+        Assert.AreEqual(2, plan.SelectedPeers.Count());
+    }
+
+    [TestMethod]
+    public void SrvMatchingNothingLeavesTheRunApplyingNowhere()
+    {
+        var plan = PlanWith(FleetConfig(), "WEB01", CommitDirectives.Parse("srv:nosuchbox"));
+
+        Assert.IsTrue(plan.ServerPlans.All(s => !s.Selected));
+        Assert.IsFalse(plan.HasPeers);
+        Assert.AreEqual(0, plan.Self.Steps.Count);
+    }
+
+    [TestMethod]
+    public void SrvCanSelectThePrimaryAlone()
+    {
+        // The other useful direction: put it live here, leave the rest of the fleet alone.
+        var plan = PlanWith(FleetConfig(), "WEB01", CommitDirectives.Parse("srv:web01"));
+
+        Assert.IsTrue(plan.Self.Selected);
+        Assert.AreNotEqual(0, plan.Self.Steps.Count);
+        Assert.IsFalse(plan.HasPeers);
+    }
+
+    // -- Fixtures for the above -------------------------------------------------
+
+    private static DeployConfig FleetConfig() => new()
+    {
+        Servers =
+        {
+            new ServerConfig { Name = "web01", Hostname = "WEB01" },
+            new ServerConfig { Name = "web02", Hostname = "WEB02", IncomingShare = @"\\WEB02\deploy\incoming" },
+            new ServerConfig { Name = "web03", Hostname = "WEB03", IncomingShare = @"\\WEB03\deploy\incoming" }
+        }
+    };
+
+    private static RolloutPlan PlanWith(DeployConfig config, string host, CommitDirectives directives)
+        => Planner.Plan("run", "sha", [Project("Web", IisTarget())], config, Handlers, host, directives, "test");
 }

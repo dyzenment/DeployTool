@@ -175,4 +175,88 @@ public sealed class CommitDirectivesTests
         CollectionAssert.AreEqual(new[] { "WebApi" }, directives.PubPatterns!.ToArray());
         Assert.AreEqual(0, directives.WaitSeconds);
     }
+
+    // -- srv: ------------------------------------------------------------------
+
+    [TestMethod]
+    public void NoSrvDirectiveMeansEveryServer()
+    {
+        // Absence and "srv:*" have to behave identically, or every existing config would
+        // suddenly deploy nowhere.
+        var directives = CommitDirectives.Parse("just a normal commit message");
+
+        Assert.IsFalse(directives.HasSrv);
+        Assert.IsTrue(directives.MatchesSrv("S1"));
+        Assert.IsTrue(directives.MatchesSrv("anything-at-all"));
+    }
+
+    [TestMethod]
+    public void SrvSelectsByNameAndGlob()
+    {
+        var directives = CommitDirectives.Parse("hotfix srv:S2|web*");
+
+        Assert.IsTrue(directives.HasSrv);
+        Assert.IsTrue(directives.MatchesSrv("S2"));
+        Assert.IsTrue(directives.MatchesSrv("web01"));
+        Assert.IsTrue(directives.MatchesSrv("WEB99"), "matching is case-insensitive");
+        Assert.IsFalse(directives.MatchesSrv("S1"));
+        Assert.IsFalse(directives.MatchesSrv("db01"));
+    }
+
+    [TestMethod]
+    public void SrvAlsoMatchesTheHostname()
+    {
+        // Both the label and the hostname appear in the output someone reads before writing
+        // the directive, so neither is obviously "the name" to type.
+        var directives = CommitDirectives.Parse("srv:EC2AMAZ-BKBMCL6");
+
+        Assert.IsTrue(directives.MatchesSrv("S1", "EC2AMAZ-BKBMCL6"));
+        Assert.IsFalse(directives.MatchesSrv("S2", "EC2AMAZ-FFQRJ6U"));
+    }
+
+    [TestMethod]
+    public void SrvStarSelectsEverything()
+    {
+        var directives = CommitDirectives.Parse("srv:*");
+
+        Assert.IsTrue(directives.HasSrv);
+        Assert.IsTrue(directives.MatchesSrv("S1"));
+        Assert.IsTrue(directives.MatchesSrv("S2"));
+    }
+
+    [TestMethod]
+    public void SrvAndPubCoexistInOneMessage()
+    {
+        var directives = CommitDirectives.Parse("hotfix pub:Proc* srv:S2 wait:0");
+
+        Assert.IsTrue(directives.MatchesPub("Processor"));
+        Assert.IsFalse(directives.MatchesPub("Web"));
+        Assert.IsTrue(directives.MatchesSrv("S2"));
+        Assert.IsFalse(directives.MatchesSrv("S1"));
+        Assert.AreEqual(0, directives.WaitSeconds);
+    }
+
+    [TestMethod]
+    public void CommandLineSrvOverridesTheCommit()
+    {
+        var commit    = CommitDirectives.Parse("srv:S1");
+        var overrides = CommitDirectives.FromValues(null, null, null, srvRaw: "S2");
+
+        var merged = commit.OverlaidWith(overrides);
+
+        Assert.IsTrue(merged.MatchesSrv("S2"));
+        Assert.IsFalse(merged.MatchesSrv("S1"));
+    }
+
+    [TestMethod]
+    public void AnAbsentCommandLineSrvLeavesTheCommitAlone()
+    {
+        // The same three-state rule the other directives follow: not specified must not read
+        // as "every server" and silently widen a deliberately narrowed rollout.
+        var commit = CommitDirectives.Parse("srv:S1");
+        var merged = commit.OverlaidWith(CommitDirectives.FromValues("Web", null));
+
+        Assert.IsTrue(merged.MatchesSrv("S1"));
+        Assert.IsFalse(merged.MatchesSrv("S2"));
+    }
 }

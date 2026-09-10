@@ -49,7 +49,8 @@ Distributed as a [.NET tool](https://learn.microsoft.com/dotnet/core/tools/globa
    waits out the soak window, and applies it. See [Setting up a peer](#setting-up-a-peer).
 6. It writes a **run report**.
 
-Commit-message directives (`pub:`, `wait:`) and command-line overrides (`--pub`, `--wait`) steer
+Commit-message directives (`pub:`, `srv:`, `wait:`) and command-line overrides (`--pub`, `--srv`,
+`--wait`) steer
 any individual run.
 
 ## Getting started (GitHub Actions)
@@ -129,6 +130,7 @@ dytools-deploy --config deploy-config.json --changed "src/App/Foo.cs|src/Lib/Bar
 | `--changed "<a\|b\|...>"` | Pipe-delimited list of changed file paths. Empty deploys nothing (unless a `pub:`/`--pub` or `--force-all` selects projects). |
 | `--force-all <true\|false>` | Deploy every enabled project regardless of changed files. |
 | `--pub "<patterns>"` | Override the commit's `pub:` - pipe-separated name globs (`"Web\|Proc*"`, `"*"`, `"none"`). Selects projects by name regardless of `--changed`. |
+| `--srv "<patterns>"` | Override the commit's `srv:` - which **servers** take part. Same glob syntax, matched against `servers[]` name or hostname. |
 | `--wait <seconds>` | Override the commit's `wait:` rollout soak delay. `0` = peers apply immediately. |
 | `--skip-tests [true\|false]` | Bypass the unit-test gate. Usable bare (`--skip-tests`). Overrides the commit's `skiptests`; pass `false` to force the gate on for a commit that asked to skip it. |
 | `--server <name>` | Pin which `servers[]` entry this box is, instead of matching on machine name. See [Which server am I?](#which-server-am-i). |
@@ -136,8 +138,8 @@ dytools-deploy --config deploy-config.json --changed "src/App/Foo.cs|src/Lib/Bar
 The tool exits `0` on success, `1` on failure. Which projects deploy is decided from the
 changed-file list against each project's folder, its `.csproj` `ProjectReference`s (resolved
 automatically), and any extra `dependentProjects` triggers. Directives `pub:<pattern>`,
-`wait:<seconds>` and `skiptests` are read from the `HEAD` commit; `--pub` / `--wait` /
-`--skip-tests` override them field by field (see [Running it by hand](#running-it-by-hand)).
+`srv:<pattern>`, `wait:<seconds>` and `skiptests` are read from the `HEAD` commit; `--pub` /
+`--srv` / `--wait` / `--skip-tests` override them field by field (see [Running it by hand](#running-it-by-hand)).
 
 ### Other commands
 
@@ -146,6 +148,7 @@ automatically), and any extra `dependentProjects` triggers. Directives `pub:<pat
 | `dytools-deploy init [path]` | Scaffold a `deploy-config.json` interactively. |
 | `dytools-deploy edit <path>` | Edit an existing one. |
 | `dytools-deploy hostname [--config <path>]` | Print every name this box is known by, and which `servers[]` entry it matches. |
+| `dytools-deploy test-peers [--config <path>]` | Check every peer is reachable and writable - resolve, tcp/445, authenticate, write. Exits 1 if any is not. |
 | `dytools-deploy install-agent` | Stand this box up as a peer: folder layout, poll script, scheduled task. |
 | `dytools-deploy uninstall-agent` | Remove the schedule. Folders and deploy history are left alone. |
 | `dytools-deploy apply [incoming]` | Apply whatever is due in an incoming folder. Run by the agent; usually not by hand. |
@@ -292,6 +295,48 @@ the others are still delivered.
 |-------|------|---------|-------------|
 | `delaySeconds` | int | `3600` | Soak time between the primary going live and peers applying. Clock starts at **primary success**. Overridden per run by `wait:` / `--wait`. |
 | `keepRuns` | int | `5` | Run folders retained per peer before the oldest are pruned. |
+| `precheckPeers` | bool | `true` | Verify every peer is reachable and writable **before building**, and abort if one is not. Off = the run still fails, just after a full build. `--no-precheck` overrides per run. |
+
+### Deploying to some servers only
+
+By default every box in `servers[]` takes part. `srv:` narrows that for one run, using the same
+glob syntax as `pub:`:
+
+```
+fix session timeout pub:Web srv:web02
+```
+
+Matched against each entry's `name` **or** `hostname`, case-insensitively, so either is fine to
+type. `--srv "web02"` overrides it on the command line, and omitting it entirely means the same
+thing as `srv:*`.
+
+| Directive | Effect |
+|---|---|
+| *(none)* | Every server. The default, and what every existing config keeps doing. |
+| `srv:web02` | Only web02. Other peers get nothing. |
+| `srv:web*` | Every server whose name or hostname starts with `web`. |
+| `srv:web02\|web03` | Those two. |
+
+**Excluding the primary is allowed and useful.** `srv:web02` run from web01 still *builds* on
+web01 - nobody else can - but applies nothing there, and ships to web02 only:
+
+```
+  S1  [self, primary, excluded by srv:]  0 step(s)
+  S2  [peer]  1 step(s)
+  S3  [peer, excluded by srv:]  0 step(s)
+  – Built but not applied here (srv: excludes this server).
+```
+
+That is how you put a build on one box to watch it before the rest of the fleet gets it, and
+`srv:web01` is the reverse - live here, leave everyone else alone.
+
+One exception, deliberately: **an excluded primary still runs Global-scope steps.** A Velopack
+upload is not something done *to* a server, so narrowing a rollout to one box does not also
+cancel the package publish.
+
+Excluded servers stay visible in the plan marked `excluded by srv:` rather than disappearing,
+and they are skipped by the peer precheck as well - a box that is not part of the run is not a
+box that has to be reachable.
 
 ### Which server am I?
 
@@ -446,9 +491,38 @@ restart. The Log On tab grants "Log on as a service" for you. Nothing goes in th
 workgroup pass-through does the rest: the peer validates the incoming credentials against its
 own SAM and lets it in.
 
-#### How the password actually reaches the tool
+#### Where the password actually lives
 
-Ordinary environment inheritance - there is no secret store and nothing is written to disk:
+Three places, and **only the first holds the real password**. The other two are references, and
+both are safe to commit.
+
+| # | Where | What goes there |
+|---|---|---|
+| 1 | GitHub, in your **application** repo: *Settings → Secrets and variables → Actions → New repository secret* | Name `DEPLOY_SHARE_PASSWORD`, value = the actual password |
+| 2 | `.github/workflows/deploy.yml` | `DEPLOY_SHARE_PASSWORD: ${{ secrets.DEPLOY_SHARE_PASSWORD }}` |
+| 3 | `deploy-config.json` | `"password": "%DEPLOY_SHARE_PASSWORD%"` |
+
+**1 - store the secret.** In the repo that holds your `deploy-config.json`:
+
+*Settings → Secrets and variables → Actions* — or straight to
+`https://github.com/<owner>/<repo>/settings/secrets/actions`.
+
+That page stacks three sections. Scroll past **Environment secrets** to **Repository secrets** and
+click the green **New repository secret**. Name it `DEPLOY_SHARE_PASSWORD`, paste the `deploysvc`
+password, **Add secret**. It is encrypted and write-only - you cannot read it back afterwards,
+only replace it.
+
+> **Do not use an environment secret** unless you know you want one. The Environment secrets
+> section prompts you to create an environment, and a secret stored there is only visible to a job
+> that declares `environment: <name>`. The Deploy job does not, so `${{ secrets.… }}` would
+> silently expand to an empty string and the peer would reject the logon - an error pointing at
+> the wrong problem entirely. Environments are for approval gates and per-stage config; this needs
+> neither.
+
+Secret names cannot begin with `GITHUB_`. An organisation secret works fine if you would rather
+scope it there.
+
+**2 - hand it to the step.** In the Deploy step of your workflow:
 
 ```yaml
       - name: Deploy
@@ -458,36 +532,90 @@ Ordinary environment inheritance - there is no secret store and nothing is writt
           dotnet dytools-deploy --config deploy-config.json --changed "$CHANGED_FILES"
 ```
 
-Actions sets that variable on the step's shell, `dytools-deploy` is a child process and inherits
-it, and `%DEPLOY_SHARE_PASSWORD%` in the config is expanded against the process environment at the
-moment the connection is opened. The same `%VAR%` mechanism every other secret in the config uses -
-`AZ_KEY` and friends - and it works identically on Windows and Linux runners.
+`${{ secrets.… }}` is a GitHub expression, not the value - GitHub substitutes the real password
+when the job starts. `examples/deploy.yml` ships this line commented out.
+
+**3 - reference it from the config.** `"password": "%DEPLOY_SHARE_PASSWORD%"`, as above.
+
+#### How it gets from there into the connection
+
+Ordinary environment inheritance - no secret store, nothing written to disk:
+
+```
+GitHub secret  →  ${{ secrets.X }} in the workflow  →  env var on the step
+               →  dytools-deploy inherits it as a child process
+               →  %DEPLOY_SHARE_PASSWORD% expanded when the share is opened
+```
+
+Expansion happens at connect time, not at config load, so the plaintext exists only in the
+runner's process memory and only for the duration of the handoff. It is the same `%VAR%`
+mechanism every other secret in the config uses (`AZ_KEY` and friends) and it behaves identically
+on Windows and Linux runners.
+
+The three names do not have to match, but keeping them identical saves you tracing it later.
 
 Two consequences worth knowing. Actions masks the secret in job logs, so even an accidental echo
-comes out as `***`. And because child processes inherit the environment, the variable is also
-visible to the build and IIS commands the tool spawns - unavoidable with env-var passing, and the
-reason this account should be scoped to the share and nothing else.
+prints `***`. And because child processes inherit the environment, the variable is also visible to
+the build and IIS commands the tool spawns - unavoidable with env-var passing, and the reason this
+account should be scoped to the share and nothing else.
 
-The tool opens a deviceless session to the share for the length of the handoff and drops it after -
-no drive letters, nothing left mapped. A bare username is qualified with the peer's name
-automatically, *except* when the share is addressed by IP, where a bare name is what Windows
-accepts. The password is never logged, never written to `result.json`, and never reaches a
-manifest; `result.json` records only which username connected.
+#### What the tool does with it
 
-A literal password warns on every run, and an environment reference that resolves to nothing is a
-hard error rather than a mystifying logon failure.
+It opens a **deviceless** session to the share for the length of the handoff and drops it after -
+no drive letters, nothing left mapped, and concurrent deliveries to different peers cannot collide
+over one. A bare username is qualified with the peer's name automatically, *except* when the share
+is addressed by IP, where a bare name is what Windows accepts.
+
+The password is never logged, never written to `result.json`, and never reaches a manifest -
+`result.json` records only which username connected. A literal password in the config warns on
+every run, and an environment reference that resolves to nothing is a hard error naming the
+variable, rather than a mystifying logon failure from the peer.
 
 > Credentials are a Windows facility. A Linux primary ignores them with a warning - mount the share
 > with its credentials before running the deploy.
 
-**Two things that bite on cloud VMs.** TCP 445 must be open from the primary (a security-group or
-NSG rule, not just the Windows firewall); and a Windows computer name only resolves by broadcast
-within one subnet, so across VPC subnets put the **private IP** in `incomingShare`. `hostname` still
-stays the computer name - it is how the peer recognises itself locally, and the two fields are
-independent.
+#### Use the IP, not the computer name
 
-Verify **as the runner's account**, not your own login - that is the mistake that makes this look
-fixed when it is not:
+Put the peer's **private IP** in `incomingShare`. On a cloud fleet a Windows computer name will
+essentially never resolve between instances: name resolution for it is NetBIOS broadcast, and an
+AWS VPC (or an Azure VNet) carries no broadcast traffic. There is no DNS record for it either -
+VPC DNS knows `ip-10-0-1-20.ec2.internal`, not `EC2AMAZ-BKBMCL6`.
+
+```jsonc
+"incomingShare": "\\\\10.0.1.20\\deploy\\incoming"
+```
+
+`hostname` still stays the computer name. It is how that box recognises *itself*, resolved
+locally, and it never goes over the wire - the two fields are independent.
+
+This one is worth knowing because of how it fails: SMB reports an unresolvable host with the same
+error it uses for a missing share (67, "bad net name"), so the message reads *"the share does not
+exist"* about a share that is sitting right there. `test-peers` separates the two.
+
+#### Checking it works
+
+```bash
+dytools-deploy test-peers --config deploy-config.json
+```
+
+Four checks per peer, in the order the failures actually happen - resolve the host, reach tcp/445,
+authenticate, write a probe into `staging` - because each one makes the next meaningless. It runs
+in about a second and exits 1 if any peer is not ready, so it can gate a script. The same checks
+run automatically before every deploy (see `rollout.precheckPeers`), which is what stops an
+unreachable peer costing you a full build to discover.
+
+To test the network path on its own, from the primary:
+
+```powershell
+Test-NetConnection 10.0.1.20 -Port 445
+```
+
+`TcpTestSucceeded : False` means the port is shut. On EC2 or Azure that is a **security-group /
+NSG rule** — the peer's group needs inbound TCP 445 from the primary — not the Windows firewall,
+which already allows File and Printer Sharing on the private profile.
+
+And to test the credential end to end, **as the runner's account** rather than your own login -
+that is the mistake that makes this look fixed when it is not:
 
 ```bat
 psexec -u .\deploysvc -p "<password>" cmd /c "dir \\10.0.1.20\deploy\incoming"
@@ -664,6 +792,7 @@ them field by field - see the [command-line reference](#command-line-reference).
 | Directive | Effect | CLI override |
 |-----------|--------|--------------|
 | `pub:Web\|Proc*` | Publish exactly these projects (pipe-separated name globs). `pub:*` publishes everything, `pub:none` nothing. | `--pub` |
+| `srv:<patterns>` | Which servers take part. Pipe-separated globs over `servers[]` name or hostname (`"S2"`, `"web*"`, `"*"`). Omit for every server. | `--srv` |
 | `wait:<seconds>` | Rollout soak delay before peers apply. | `--wait` |
 | `skiptests` | Deploy without running the unit-test gate. Also spelled `skip-tests` / `skip_tests`, and `skiptests:false` forces the gate back on. | `--skip-tests` |
 

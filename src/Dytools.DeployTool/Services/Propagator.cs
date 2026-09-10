@@ -58,7 +58,9 @@ public static class Propagator
         var results      = new List<PropagationResult>();
         var notBeforeUtc = primarySucceededAt.ToUniversalTime().AddSeconds(plan.WaitSeconds);
 
-        foreach (var peer in plan.Peers)
+        // SelectedPeers, not Peers: a box an srv: directive excluded is not "nothing to ship",
+        // it is "not part of this run" - it gets no run folder and no report entry.
+        foreach (var peer in plan.SelectedPeers)
         {
             var result = new PropagationResult
             {

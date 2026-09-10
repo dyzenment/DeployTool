@@ -34,6 +34,14 @@ public static class Planner
                                .Select(t => t.Step)
                                .ToList();
 
+        // Global-scope work (a Velopack upload) is not server work, so an srv: directive that
+        // excludes this box still leaves it holding these. Skipping them would turn "roll out
+        // to WEB02 only" into "and also silently do not publish the package", which is not
+        // what anyone means by it.
+        var globalSteps = targets.Where(t => t.Scope == DeployScope.Global)
+                                 .Select(t => t.Step)
+                                 .ToList();
+
         return new RolloutPlan
         {
             RunId       = runId,
@@ -46,7 +54,7 @@ public static class Planner
                 Reason   = selectionReason
             },
             Targets     = targets,
-            ServerPlans = BuildServerPlans(config, selfHostname, allSteps, peerSteps)
+            ServerPlans = BuildServerPlans(config, selfHostname, directives, allSteps, peerSteps, globalSteps)
         };
     }
 
@@ -107,8 +115,10 @@ public static class Planner
     private static List<ServerPlan> BuildServerPlans(
         DeployConfig config,
         string selfHostname,
+        CommitDirectives directives,
         List<Models.Manifest.ApplyStep> allSteps,
-        List<Models.Manifest.ApplyStep> peerSteps)
+        List<Models.Manifest.ApplyStep> peerSteps,
+        List<Models.Manifest.ApplyStep> globalSteps)
     {
         // No fleet configured: single-box, exactly as the tool has always behaved.
         if (config.Servers.Count == 0)
@@ -133,21 +143,50 @@ public static class Planner
                 $"[Planner] This host ('{selfHostname}') matched servers[] entry " +
                 $"'{match.Server.Name}' by {match.Reason}.");
 
-        return config.Servers.Select(server =>
+        var plans = config.Servers.Select(server =>
         {
-            var isSelf = ReferenceEquals(server, match.Server);
+            var isSelf   = ReferenceEquals(server, match.Server);
+            var selected = directives.MatchesSrv(server.Name, server.Hostname);
+
             return new ServerPlan
             {
                 ServerName    = server.Name,
                 IsSelf        = isSelf,
+                Selected      = selected,
                 IncomingShare = isSelf ? null : server.IncomingShare,
                 ShareUsername = isSelf ? null : server.Username,
                 SharePassword = isSelf ? null : server.Password,
-                // Self runs everything. A peer gets Server-scoped steps only - Global steps
-                // are emitted once, on the primary, and never travel.
-                Steps         = isSelf ? allSteps : peerSteps
+
+                // Self runs everything. A peer gets Server-scoped steps only - Global steps are
+                // emitted once, on the primary, and never travel. An excluded box gets nothing,
+                // except that an excluded PRIMARY keeps its Global steps: it still has to build
+                // (nobody else can) and a package upload is not something it does "to a server".
+                Steps = (isSelf, selected) switch
+                {
+                    (true,  true)  => allSteps,
+                    (true,  false) => globalSteps,
+                    (false, true)  => peerSteps,
+                    (false, false) => []
+                }
             };
         }).ToList();
+
+        if (directives.HasSrv)
+        {
+            var excluded = plans.Where(p => !p.Selected).Select(p => p.ServerName).ToList();
+
+            Console.WriteLine(excluded.Count == 0
+                ? $"[Planner] srv: {string.Join(" | ", directives.SrvPatterns!)} -- every server matched."
+                : $"[Planner] srv: {string.Join(" | ", directives.SrvPatterns!)} -- excluding " +
+                  string.Join(", ", excluded));
+
+            if (plans.All(p => !p.Selected))
+                Console.WriteLine(
+                    "[Planner] Warning: srv: matched no servers, so this run applies nowhere. " +
+                    "Projects will still be built.");
+        }
+
+        return plans;
     }
 
     private static ServerPlan SelfOnly(string selfHostname, List<Models.Manifest.ApplyStep> allSteps)

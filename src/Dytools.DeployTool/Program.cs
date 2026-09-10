@@ -40,6 +40,9 @@ internal class Program
             // Which servers[] entry is this box? Answers it without running a deploy.
             case "hostname" or "whoami": return await RunHostnameAsync(args);
 
+            // Can this box actually reach its peers? Same checks a deploy runs, no build.
+            case "test-peers":           return await RunTestPeersAsync(args);
+
             case "help" or "h" or "?":   PrintUsage(); return 0;
             case "":                     PrintUsage(); return 1;
         }
@@ -179,16 +182,20 @@ internal class Program
         var cliOverrides = CommitDirectives.FromValues(
             parsedArgs.GetOptional("pub"),
             parsedArgs.GetOptionalInt("wait"),
-            parsedArgs.GetOptionalBool("skip-tests"));
+            parsedArgs.GetOptionalBool("skip-tests"),
+            parsedArgs.GetOptional("srv"));
         var directives = commitDirectives.OverlaidWith(cliOverrides);
 
         var subject = commitMessage.Split('\n').FirstOrDefault()?.Trim();
         if (!string.IsNullOrWhiteSpace(subject))
             Console.WriteLine($"  Message: {subject}");
-        if (cliOverrides.HasPub || cliOverrides.WaitSeconds.HasValue || cliOverrides.SkipTests.HasValue)
+        if (cliOverrides.HasPub || cliOverrides.HasSrv
+            || cliOverrides.WaitSeconds.HasValue || cliOverrides.SkipTests.HasValue)
             Console.WriteLine("  (directives overridden from command line)");
         if (directives.HasPub)
             Console.WriteLine($"  Directive pub:  {string.Join(" | ", directives.PubPatterns!)}");
+        if (directives.HasSrv)
+            Console.WriteLine($"  Directive srv:  {string.Join(" | ", directives.SrvPatterns!)}");
         if (directives.WaitSeconds.HasValue)
             Console.WriteLine($"  Directive wait: {directives.WaitSeconds.Value}s");
         if (directives.SkipTests == true)
@@ -258,6 +265,33 @@ internal class Program
         // its own poller could see it, the poller could pick it up mid-apply and run it
         // concurrently. Task Scheduler's IgnoreNew guards task-vs-task, not task-vs-primary.
 
+        // -- Peer precheck -----------------------------------------------------
+        // Before the build, not after it. Everything checked here is knowable in about a
+        // second and none of it depends on build output, so discovering an unreachable peer
+        // at propagation time means having paid for a full compile and test cycle first.
+
+        if (plan.HasPeers && (deployConfig.Rollout?.PrecheckPeers ?? true)
+                          && !parsedArgs.GetFlag("no-precheck"))
+        {
+            Console.WriteLine("\n-- Peer Precheck -----------------------------------------------");
+
+            var peerTargets = plan.SelectedPeers
+                .Select(p => new PeerTarget(p.ServerName, p.IncomingShare, p.ShareUsername, p.SharePassword))
+                .ToList();
+
+            if (!await PeerPrecheck.RunAsync(peerTargets))
+            {
+                Console.WriteLine(
+                    "\n  ✗ One or more peers are not ready. Nothing was built.\n" +
+                    "    Fix the above, or set rollout.precheckPeers to false (or pass " +
+                    "--no-precheck) to\n    deploy locally anyway and let propagation fail later.");
+
+                report.CompletedAt = DateTimeOffset.Now;
+                WriteReport(report);
+                return 1;
+            }
+        }
+
         var stagingRoot = Path.Combine(Path.GetTempPath(), "DeployTool", "staging", runId);
         Directory.CreateDirectory(stagingRoot);
 
@@ -293,7 +327,7 @@ internal class Program
                 else
                     Console.WriteLine(
                         "  Primary failed -- no manifests written. " +
-                        $"{plan.ServerPlans.Count(s => !s.IsSelf)} peer(s) receive nothing.");
+                        $"{plan.SelectedPeers.Count()} peer(s) receive nothing.");
             }
         }
         finally
@@ -476,6 +510,62 @@ internal class Program
         return 0;
     }
 
+    // -- test-peers ------------------------------------------------------------
+
+    /// <summary>
+    /// The precheck on its own, so a fleet can be verified without committing anything or
+    /// waiting for a build. Exits 1 if any peer is not ready, so it can gate a script.
+    /// </summary>
+    private static async Task<int> RunTestPeersAsync(string[] args)
+    {
+        var parsed     = Args.Parse(args);
+        var configPath = parsed.GetOptional("config") ?? Positional(args, 1) ?? "deploy-config.json";
+
+        if (!File.Exists(configPath))
+        {
+            Console.WriteLine($"\n  ✗ No such config file: {configPath}");
+            return 1;
+        }
+
+        var config = JsonSerializer.Deserialize<DeployConfig>(
+            await File.ReadAllTextAsync(configPath), JsonOptions.Default);
+
+        if (config is null)
+        {
+            Console.WriteLine($"\n  ✗ Could not parse {configPath}.");
+            return 1;
+        }
+
+        var identity = HostIdentity.Resolve(parsed.GetOptional("server"));
+        var self     = HostIdentity.Find(config.Servers, identity)?.Server;
+
+        Console.WriteLine();
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+        Console.WriteLine("  DeployTool  peer check");
+        Console.WriteLine($"  From:   {identity}{(self is null ? "  (not listed in servers[])" : $"  = {self.Name}")}");
+        Console.WriteLine("═══════════════════════════════════════════════════════════════");
+
+        // Every server except this one - exactly the set a deploy from here would ship to.
+        var peers = config.Servers
+            .Where(server => !ReferenceEquals(server, self))
+            .Select(server => new PeerTarget(server.Name, server.IncomingShare, server.Username, server.Password))
+            .ToList();
+
+        if (peers.Count == 0)
+        {
+            Console.WriteLine("\n  No peers to check - this is a single-box configuration.");
+            return 0;
+        }
+
+        var ok = await PeerPrecheck.RunAsync(peers);
+
+        Console.WriteLine(ok
+            ? $"\n  ✓ All {peers.Count} peer(s) reachable and writable.\n"
+            : "\n  ✗ At least one peer is not ready - see above.\n");
+
+        return ok ? 0 : 1;
+    }
+
     // -- Usage -----------------------------------------------------------------
 
     private static void PrintUsage()
@@ -488,10 +578,12 @@ internal class Program
             dytools-deploy --config <path> [options]
               --changed "a|b|c"    Pipe-separated changed files. Decides what needs deploying.
               --force-all true     Deploy everything, ignoring the changed-file diff.
-              --pub "Web|Proc*"    Override the commit's pub: directive.
+              --pub "Web|Proc*"    Override the commit's pub: directive - which projects.
+              --srv "S2|web*"      Override the commit's srv: directive - which servers.
               --wait <seconds>     Override the rollout soak delay. 0 = peers apply immediately.
               --skip-tests         Bypass the unit-test gate.
               --server <name>      Pin which servers[] entry this box is.
+              --no-precheck        Skip the peer reachability check and build anyway.
 
           Peer
             dytools-deploy apply [incoming]     Apply whatever is due. Run by the agent every minute.
@@ -506,7 +598,8 @@ internal class Program
               --no-prompt          Skip that offer and print the commands instead.
 
           Diagnostics
-            dytools-deploy hostname [--config <path>]   Which servers[] entry is this box?
+            dytools-deploy hostname [--config <path>]     Which servers[] entry is this box?
+            dytools-deploy test-peers [--config <path>]   Can this box reach and write to its peers?
 
           Config
             dytools-deploy init [path]          Scaffold a deploy-config.json.
@@ -530,8 +623,21 @@ internal class Program
     {
         foreach (var server in plan.ServerPlans)
         {
-            var role = server.IsSelf ? "self, primary" : "peer";
-            Console.WriteLine($"  {server.ServerName}  [{role}]  {server.Steps.Count} step(s)");
+            var role     = server.IsSelf ? "self, primary" : "peer";
+            var excluded = server.Selected ? string.Empty : ", excluded by srv:";
+            Console.WriteLine($"  {server.ServerName}  [{role}{excluded}]  {server.Steps.Count} step(s)");
+
+            // Where a peer's run folder is going, and who it will be written as. Both come
+            // from config and were previously invisible until propagation failed - which
+            // happens after the build, so a stale or mistyped share cost a full run to find.
+            if (!server.IsSelf && server.Selected)
+            {
+                Console.WriteLine($"      → {server.IncomingShare ?? "(no incomingShare configured!)"}");
+
+                if (!string.IsNullOrWhiteSpace(server.ShareUsername))
+                    Console.WriteLine($"        as {server.ShareUsername}");
+            }
+
             foreach (var step in server.Steps)
                 Console.WriteLine($"      {step.Project,-22} {step.Label}");
         }
@@ -593,6 +699,22 @@ internal class Program
             }
 
             // -- Apply ---------------------------------------------------------
+            // Self's plan is the authority on what runs here. An srv: directive that excludes
+            // this box empties it (bar Global steps), and the build above still had to happen -
+            // the artifacts are what the peers are waiting for.
+            if (!plan.Self.Steps.Contains(targetPlan.Step))
+            {
+                result.TargetResults.Add(new TargetDeployResult
+                {
+                    TargetLabel   = $"{targetPlan.Step.Label}  [built, not applied here]",
+                    Type          = target.Type,
+                    Success       = true,
+                    PublishResult = publishResult
+                });
+                Console.WriteLine("  – Built but not applied here (srv: excludes this server).");
+                continue;
+            }
+
             // The step's artifact path is stored relative so the same object can travel to
             // a peer; rebasing resolves it against this box's staging folder.
             var targetResult = await handlers[target.Type]
