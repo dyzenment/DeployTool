@@ -12,7 +12,9 @@ namespace Dytools.DeployTool.Resolvers;
 /// does not change the bits - but two targets that disagree on it are asking for two
 /// different command lines, and silently running one of them for both is the kind of
 /// surprise this tool exists to avoid. A null build block is the default build, so a target
-/// that omits <c>build</c> shares with one that spells out the defaults.
+/// that omits <c>build</c> shares with one that spells out the defaults - and "spells out"
+/// includes <c>selfContained: false</c>, <c>singleFile: false</c> and <c>noWarn: ""</c>,
+/// each of which is what the SDK does anyway when the field is absent.
 /// </summary>
 public static class BuildVariant
 {
@@ -34,16 +36,16 @@ public static class BuildVariant
             Norm(build.Configuration),
             Norm(build.Runtime),
             Norm(build.TargetFramework),
-            build.SelfContained?.ToString() ?? string.Empty,
-            build.SingleFile?.ToString() ?? string.Empty,
+            build.SelfContained == true ? "sc" : string.Empty,
+            build.SingleFile    == true ? "single" : string.Empty,
             noWarn is null ? string.Empty : string.Join(",", noWarn));
     }
 
     /// <summary>
     /// Folder-name fragment: "release-win-x64-net8.0-sc-single". Only the fields that
-    /// describe the output take part, so the name says what is inside without becoming a
-    /// hash. Not unique on its own - the planner disambiguates when two variants collide here
-    /// but differ in Key.
+    /// describe the output take part, and the booleans only when true, so the name says what
+    /// is inside without becoming a hash. Not unique on its own - the planner disambiguates
+    /// when two variants collide here but differ in Key.
     /// </summary>
     public static string Slug(BuildConfig? build)
     {
@@ -53,7 +55,7 @@ public static class BuildVariant
 
         if (!string.IsNullOrWhiteSpace(build.Runtime))         parts.Add(Norm(build.Runtime));
         if (!string.IsNullOrWhiteSpace(build.TargetFramework)) parts.Add(Norm(build.TargetFramework));
-        if (build.SelfContained is { } sc)                      parts.Add(sc ? "sc" : "fdd");
+        if (build.SelfContained == true)                        parts.Add("sc");
         if (build.SingleFile == true)                           parts.Add("single");
 
         return string.Join("-", parts.Select(Safe));
@@ -68,7 +70,7 @@ public static class BuildVariant
 
         if (!string.IsNullOrWhiteSpace(build.Runtime))         parts.Add(build.Runtime);
         if (!string.IsNullOrWhiteSpace(build.TargetFramework)) parts.Add(build.TargetFramework);
-        if (build.SelfContained is { } sc)                      parts.Add(sc ? "self-contained" : "framework-dependent");
+        if (build.SelfContained == true)                        parts.Add("self-contained");
         if (build.SingleFile == true)                           parts.Add("single-file");
 
         return string.Join(" / ", parts);

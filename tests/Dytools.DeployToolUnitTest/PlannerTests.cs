@@ -254,6 +254,25 @@ public sealed class PlannerTests
     }
 
     [TestMethod]
+    public void ExplicitFalseAndEmpty_EqualOmitted()
+    {
+        // The SDK treats an absent selfContained/singleFile as false and an empty noWarn as
+        // none, so a config that spells those out must share with one that leaves them off.
+        var plan = Plan(Config(), "BOX",
+            Project("Web",
+                FolderTarget(build: new BuildConfig { Configuration = "Release", Runtime = "win-x64" }),
+                IisTarget(build: new BuildConfig
+                {
+                    Configuration = "Release", Runtime = "win-x64",
+                    SelfContained = false, SingleFile = false, NoWarn = ""
+                })));
+
+        Assert.AreEqual(1, plan.Publishes.Count);
+        Assert.AreEqual("artifacts/Web-release-win-x64", plan.Publishes.Single().ArtifactRelativePath);
+        Assert.AreEqual("Release / win-x64", plan.Publishes.Single().Label);
+    }
+
+    [TestMethod]
     public void DifferentRuntime_GetsSeparatePublishes()
     {
         var plan = Plan(Config(), "BOX",
