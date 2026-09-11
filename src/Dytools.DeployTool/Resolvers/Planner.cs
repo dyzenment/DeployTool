@@ -145,9 +145,22 @@ public static class Planner
         List<Models.Manifest.ApplyStep> peerSteps,
         List<Models.Manifest.ApplyStep> globalSteps)
     {
+        var viaAgent = config.Rollout?.ApplyViaAgent;
+
+        // Only "always the agent" is a hard requirement on config. "Try the agent if needed"
+        // degrades to a message at the point of need when there is no share to use.
+        var required = viaAgent == true;
+
         // No fleet configured: single-box, exactly as the tool has always behaved.
         if (config.Servers.Count == 0)
+        {
+            if (required) throw new DeployException(
+                "rollout.applyViaAgent is on but servers[] is empty. The primary reaches its own agent " +
+                "through its servers[] entry's incomingShare, exactly as it reaches a peer - add an " +
+                "entry for this host (run 'dytools-deploy hostname' to see what it needs to match).");
+
             return [SelfOnly(selfHostname, allSteps)];
+        }
 
         var match = HostIdentity.Find(config.Servers, selfHostname);
 
@@ -156,6 +169,11 @@ public static class Planner
         // machine is the worse failure.
         if (match is null)
         {
+            if (required) throw new DeployException(
+                $"rollout.applyViaAgent is on but this host ('{selfHostname}') matches nothing in servers[], " +
+                "so there is no incomingShare to hand its steps through. " +
+                "Run 'dytools-deploy hostname --config <path>' to see what it would need to match.");
+
             Console.WriteLine(
                 $"[Planner] This host ('{selfHostname}') is not listed in servers[] -- " +
                 "deploying locally only, no propagation. " +
@@ -168,19 +186,30 @@ public static class Planner
                 $"[Planner] This host ('{selfHostname}') matched servers[] entry " +
                 $"'{match.Server.Name}' by {match.Reason}.");
 
+        if (required && string.IsNullOrWhiteSpace(match.Server.IncomingShare))
+            throw new DeployException(
+                $"rollout.applyViaAgent is on but servers[] entry '{match.Server.Name}' (this host) has no " +
+                "incomingShare. Set it to this box's own incoming folder, the same way a peer's is set - " +
+                "e.g. \"\\\\" + Environment.MachineName + "\\deploy\\incoming\" or \"C:\\deploy\\incoming\".");
+
         var plans = config.Servers.Select(server =>
         {
             var isSelf   = ReferenceEquals(server, match.Server);
             var selected = directives.MatchesSrv(server.Name, server.Hostname);
+
+            // Self normally has no share - it applies from staging. When it may hand steps to
+            // its own agent it is reached exactly like a peer, so it keeps share and credentials.
+            var reachable = !isSelf || viaAgent != false;
 
             return new ServerPlan
             {
                 ServerName    = server.Name,
                 IsSelf        = isSelf,
                 Selected      = selected,
-                IncomingShare = isSelf ? null : server.IncomingShare,
-                ShareUsername = isSelf ? null : server.Username,
-                SharePassword = isSelf ? null : server.Password,
+                ApplyViaAgent = isSelf ? viaAgent : null,
+                IncomingShare = reachable ? server.IncomingShare : null,
+                ShareUsername = reachable ? server.Username : null,
+                SharePassword = reachable ? server.Password : null,
 
                 // Self runs everything. A peer gets Server-scoped steps only - Global steps are
                 // emitted once, on the primary, and never travel. An excluded box gets nothing,

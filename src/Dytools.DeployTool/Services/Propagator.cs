@@ -87,7 +87,7 @@ public static class Propagator
 
             try
             {
-                ShipToPeer(plan, peer, stagingRoot, keepRuns, notBeforeUtc, result);
+                Ship(plan, peer, stagingRoot, keepRuns, notBeforeUtc, result);
                 result.Success = true;
                 Console.WriteLine($"    ✓ Delivered to {result.RunFolder}");
             }
@@ -107,7 +107,12 @@ public static class Propagator
 
     // -- One peer --------------------------------------------------------------
 
-    private static void ShipToPeer(
+    /// <summary>
+    /// Delivers one server's run folder. Public because the local agent fallback ships to
+    /// this same box through it: a ServerPlan whose incomingShare is a local path is just a
+    /// peer that happens to be nearby, and there is deliberately no second delivery code path.
+    /// </summary>
+    public static void Ship(
         RolloutPlan plan,
         ServerPlan peer,
         string stagingRoot,

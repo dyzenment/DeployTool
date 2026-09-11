@@ -215,6 +215,23 @@ public sealed class RolloutConfig
     /// </summary>
     [JsonPropertyName("precheckPeers")]
     public bool PrecheckPeers { get; set; } = true;
+
+    /// <summary>
+    /// Who applies the primary's server-scoped steps on this box.
+    ///
+    ///   true  - always the agent installed here (SYSTEM). Fire and forget, like a peer: the
+    ///           run folder lands under this host's own incomingShare and the agent applies
+    ///           it on its next poll. Requires a servers[] entry for this host with an
+    ///           incomingShare.
+    ///   false - always this process, inline. A permissions failure fails the run.
+    ///   null  - inline first; a target that fails with access denied (the CI runner's account
+    ///           cannot control IIS, stop a service, or write the destination) is then handed
+    ///           to the agent, if this host's servers[] entry has an incomingShare. Default.
+    ///
+    /// Global-scope steps (a Velopack upload) always run inline - they need no rights here.
+    /// </summary>
+    [JsonPropertyName("applyViaAgent")]
+    public bool? ApplyViaAgent { get; set; }
 }
 
 // -----------------------------------------------------------------------------

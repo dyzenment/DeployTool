@@ -33,8 +33,12 @@ public sealed class DeployReport
     public List<StepResult> PrerequisiteResults { get; init; } = [];
     public List<ProjectDeployResult> Results { get; init; } = [];
 
-    /// <summary>One entry per peer this run shipped to. Empty on a single-box run.</summary>
+    /// <summary>
+    /// One entry per server this run shipped a run folder to. Empty on a single-box run. With
+    /// applyViaAgent the primary's own handoff to its agent is recorded here too, first.
+    /// </summary>
     public List<PropagationResult> Propagation { get; init; } = [];
+
 }
 
 /// <summary>
@@ -137,6 +141,13 @@ public sealed class TargetDeployResult
     public bool Success { get; set; }
     public string? ErrorMessage { get; set; }
     public bool RolledBack { get; set; }
+
+    /// <summary>
+    /// Null when the deploying process applied the target itself. "agent" when this box's
+    /// agent did it on the primary's behalf - see rollout.applyViaAgent.
+    /// </summary>
+    public string? AppliedBy { get; set; }
+
     public List<StepResult> DeploySteps { get; init; } = [];
 }
 

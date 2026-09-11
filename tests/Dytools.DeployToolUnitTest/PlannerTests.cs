@@ -1,3 +1,4 @@
+using Dytools.DeployTool;
 using Dytools.DeployTool.Helpers;
 using Dytools.DeployTool.Models.Config;
 using Dytools.DeployTool.Models.Plan;
@@ -126,12 +127,16 @@ public sealed class PlannerTests
     }
 
     [TestMethod]
-    public void PeerCarriesItsIncomingShare_AndSelfDoesNot()
+    public void PeerCarriesItsIncomingShare_AndSelfOnlyWhenItMayHandOff()
     {
-        var plan = Plan(Config(Web1, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
+        // Default (applyViaAgent null): self keeps its share so an access-denied target has
+        // somewhere to go. With false it never hands off, so it has no use for one.
+        var byDefault = Plan(Config(Web1, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
+        Assert.AreEqual(Web1.IncomingShare, byDefault.Self.IncomingShare);
+        Assert.AreEqual(@"\\WEBSERVER02\deploy\incoming", byDefault.Peers.Single().IncomingShare);
 
-        Assert.IsNull(plan.Self.IncomingShare, "the primary applies inline from staging");
-        Assert.AreEqual(@"\\WEBSERVER02\deploy\incoming", plan.Peers.Single().IncomingShare);
+        var inlineOnly = Plan(ViaAgentConfig(false, Web1, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
+        Assert.IsNull(inlineOnly.Self.IncomingShare, "applyViaAgent false: the primary applies inline from staging only");
     }
 
     // -- Scope: the velopack rule ---------------------------------------------
@@ -354,6 +359,119 @@ public sealed class PlannerTests
         var peer = plan.Peers.Single();
         Assert.AreEqual(2, peer.Steps.Count);
         Assert.AreEqual(1, peer.Steps.Select(s => s.Artifact).Distinct().Count());
+    }
+
+    // -- applyViaAgent ---------------------------------------------------------
+
+    private static DeployConfig ViaAgentConfig(bool? mode, params ServerConfig[] servers)
+    {
+        var c = Config(servers);
+        c.Rollout!.ApplyViaAgent = mode;
+        return c;
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_True_SelfKeepsItsShare_AndHandsOffServerScopedStepsOnly()
+    {
+        var plan = Plan(ViaAgentConfig(true, Web1, Web2), "WEBSERVER01",
+            Project("WebApp", IisTarget()),
+            Project("Admin", VelopackTarget()));
+
+        Assert.AreEqual(true, plan.Self.ApplyViaAgent);
+        Assert.AreEqual(Web1.IncomingShare, plan.Self.IncomingShare, "self is reached like a peer");
+        Assert.IsTrue(plan.SelfCanHandOff);
+        Assert.AreEqual(2, plan.Self.Steps.Count, "self's plan is still the whole plan");
+
+        var handed = plan.SelfAgentSteps;
+        Assert.AreEqual(1, handed.Count);
+        Assert.AreEqual("WebApp", handed[0].Project, "the Velopack step stays inline - it needs no rights here");
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_Null_KeepsShareForASecondAttempt_ButPlansNothingUpFront()
+    {
+        var plan = Plan(ViaAgentConfig(null, Web1, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
+
+        Assert.IsNull(plan.Self.ApplyViaAgent);
+        Assert.AreEqual(Web1.IncomingShare, plan.Self.IncomingShare);
+        Assert.IsTrue(plan.SelfCanHandOff);
+        Assert.AreEqual(0, plan.SelfAgentSteps.Count, "with null the decision is per target, after the inline attempt");
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_Null_WithoutAShare_CannotHandOff_AndIsNotAnError()
+    {
+        var bare = new ServerConfig { Name = "web1", Hostname = "WEBSERVER01" };
+        var plan = Plan(ViaAgentConfig(null, bare, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
+
+        Assert.IsFalse(plan.SelfCanHandOff);
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_False_LeavesSelfWithoutAShare()
+    {
+        var plan = Plan(ViaAgentConfig(false, Web1, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
+
+        Assert.AreEqual(false, plan.Self.ApplyViaAgent);
+        Assert.IsNull(plan.Self.IncomingShare);
+        Assert.IsFalse(plan.SelfCanHandOff);
+        Assert.AreEqual(0, plan.SelfAgentSteps.Count);
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_PeersAreUnaffected()
+    {
+        var plan = Plan(ViaAgentConfig(true, Web1, Web2), "WEBSERVER01", Project("WebApp", IisTarget()));
+
+        var peer = plan.Peers.Single();
+        Assert.IsNull(peer.ApplyViaAgent);
+        Assert.AreEqual(Web2.IncomingShare, peer.IncomingShare);
+        Assert.AreEqual(1, peer.Steps.Count);
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_True_SelfExcludedBySrv_HandsOffNothing()
+    {
+        var directives = CommitDirectives.Parse("srv:web2");
+        var plan = Planner.Plan("run-1", "abc", [Project("WebApp", IisTarget())], ViaAgentConfig(true, Web1, Web2),
+                                Handlers, "WEBSERVER01", directives, "test");
+
+        Assert.AreEqual(0, plan.SelfAgentSteps.Count, "an excluded self has nothing server-scoped to hand off");
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_True_WithoutServers_IsAConfigError()
+    {
+        var c = new DeployConfig { Rollout = new RolloutConfig { ApplyViaAgent = true } };
+        var ex = Assert.ThrowsException<DeployException>(() => Plan(c, "ANYBOX", Project("WebApp", IisTarget())));
+        StringAssert.Contains(ex.Message, "servers[] is empty");
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_True_UnlistedHost_IsAConfigError()
+    {
+        var ex = Assert.ThrowsException<DeployException>(
+            () => Plan(ViaAgentConfig(true, Web1, Web2), "STRANGER", Project("WebApp", IisTarget())));
+        StringAssert.Contains(ex.Message, "matches nothing in servers[]");
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_True_SelfWithoutIncomingShare_IsAConfigError()
+    {
+        var bare = new ServerConfig { Name = "web1", Hostname = "WEBSERVER01" };
+        var ex = Assert.ThrowsException<DeployException>(
+            () => Plan(ViaAgentConfig(true, bare, Web2), "WEBSERVER01", Project("WebApp", IisTarget())));
+        StringAssert.Contains(ex.Message, "has no incomingShare");
+    }
+
+    [TestMethod]
+    public void ApplyViaAgent_Null_SingleBox_IsNotAnError()
+    {
+        var c = new DeployConfig { Rollout = new RolloutConfig { ApplyViaAgent = null } };
+        var plan = Plan(c, "ANYBOX", Project("WebApp", IisTarget()));
+
+        Assert.IsFalse(plan.SelfCanHandOff);
+        Assert.AreEqual(1, plan.Self.Steps.Count);
     }
 
     private static string Describe(BuildConfig b) =>

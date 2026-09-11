@@ -56,6 +56,19 @@ public sealed class RolloutPlan
     public IEnumerable<ServerPlan> Peers => ServerPlans.Where(s => !s.IsSelf);
 
     /// <summary>
+    /// The server-scoped steps this box hands to its own agent up front - every one of them
+    /// when applyViaAgent is true, none otherwise. (With null the decision is made per target
+    /// after the inline attempt, so it is not knowable here.)
+    /// </summary>
+    public List<ApplyStep> SelfAgentSteps => Self.ApplyViaAgent == true
+        ? Targets.Where(t => t.Scope == DeployScope.Server && Self.Steps.Contains(t.Step))
+                 .Select(t => t.Step).ToList()
+        : [];
+
+    /// <summary>Whether this box can hand anything to its own agent at all.</summary>
+    public bool SelfCanHandOff => Self.ApplyViaAgent != false && !string.IsNullOrWhiteSpace(Self.IncomingShare);
+
+    /// <summary>
     /// The peers this run actually ships to - Peers minus anything an srv: directive excluded.
     /// This is what propagation and the precheck work from; Peers is only for display, so an
     /// excluded box still appears in the plan rather than silently vanishing.
@@ -134,12 +147,22 @@ public sealed class ServerPlan
     /// </summary>
     public bool Selected { get; init; } = true;
 
-    /// <summary>Where to drop this peer's run folder. Null for self.</summary>
+    /// <summary>
+    /// rollout.applyViaAgent, carried on the self plan only: true = every server-scoped step
+    /// goes to this box's agent, false = none do, null = only those that fail inline with
+    /// access denied. Always null on a peer.
+    /// </summary>
+    public bool? ApplyViaAgent { get; init; }
+
+    /// <summary>
+    /// Where to drop this server's run folder. Null for self unless it may hand steps to its
+    /// own agent (ApplyViaAgent is not false) and its servers[] entry has one.
+    /// </summary>
     public string? IncomingShare { get; init; }
 
     /// <summary>
     /// Credentials for reaching <see cref="IncomingShare"/>, when the primary's own identity is
-    /// not enough. Null for self, and for any peer on a shared identity.
+    /// not enough. Null for self (unless ApplyViaAgent), and for any peer on a shared identity.
     ///
     /// A ServerPlan never leaves the primary's memory - only ApplyStep travels, inside a
     /// manifest that sits on a file share. Keep it that way: nothing here may be serialized.

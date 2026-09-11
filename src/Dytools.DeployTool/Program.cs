@@ -3,6 +3,7 @@ using System.Text.Json;
 using Dytools.DeployTool;
 using Dytools.DeployTool.Helpers;
 using Dytools.DeployTool.Models.Config;
+using Dytools.DeployTool.Models.Manifest;
 using Dytools.DeployTool.Models.Plan;
 using Dytools.DeployTool.Models.Reporting;
 using Dytools.DeployTool.Resolvers;
@@ -249,9 +250,20 @@ internal class Program
         // The entire rollout -- every server, every step -- decided here in one shot from
         // one set of inputs, so peer plans are never recomputed later or on the peer itself.
 
-        var plan = Planner.Plan(
-            runId, commitSha, projectsToDeploy, deployConfig, handlers,
-            serverName, directives, selection.Reason);
+        RolloutPlan plan;
+        try
+        {
+            plan = Planner.Plan(
+                runId, commitSha, projectsToDeploy, deployConfig, handlers,
+                serverName, directives, selection.Reason);
+        }
+        catch (DeployException ex)
+        {
+            Console.WriteLine($"\n  ✗ {ex.Message}");
+            report.CompletedAt = DateTimeOffset.Now;
+            WriteReport(report);
+            return 1;
+        }
 
         Console.WriteLine("\n-- Rollout Plan ------------------------------------------------");
         PrintPlan(plan);
@@ -270,12 +282,15 @@ internal class Program
         // second and none of it depends on build output, so discovering an unreachable peer
         // at propagation time means having paid for a full compile and test cycle first.
 
-        if (plan.HasPeers && (deployConfig.Rollout?.PrecheckPeers ?? true)
-                          && !parsedArgs.GetFlag("no-precheck"))
+        if ((plan.HasPeers || plan.SelfCanHandOff) && (deployConfig.Rollout?.PrecheckPeers ?? true)
+                                                    && !parsedArgs.GetFlag("no-precheck"))
         {
             Console.WriteLine("\n-- Peer Precheck -----------------------------------------------");
 
-            var peerTargets = plan.SelectedPeers
+            // Self first when it may hand steps to its own agent: it is checked exactly as a
+            // peer is, because it would be delivered to exactly as a peer is.
+            var peerTargets = (plan.SelfCanHandOff ? [plan.Self] : Enumerable.Empty<ServerPlan>())
+                .Concat(plan.SelectedPeers)
                 .Select(p => new PeerTarget(p.ServerName, p.IncomingShare, p.ShareUsername, p.SharePassword))
                 .ToList();
 
@@ -299,14 +314,49 @@ internal class Program
         {
             // -- Deploy each project (sequential) ---------------------------------
 
+            var attempts = new List<(ApplyStep Step, ProjectDeployResult Project, TargetDeployResult Result)>();
+
             foreach (var project in projectsToDeploy)
             {
                 Console.WriteLine();
                 Console.WriteLine($"══ Project: {project.Name} ══════════════════════════════════════");
 
                 var projectResult = await DeployProjectAsync(
-                    project, plan, handlers, registry, stagingRoot);
+                    project, plan, handlers, registry, stagingRoot, attempts);
                 report.Results.Add(projectResult);
+            }
+
+            // -- This box, via its agent ------------------------------------------
+            // Fire and forget, like a peer. true: every server-scoped step, gated the same way
+            // peers are - nothing inline may have failed. null: only the targets that failed
+            // inline for lack of rights; everything else already has its verdict.
+            var keepRuns = deployConfig.Rollout?.KeepRuns ?? 5;
+
+            if (plan.Self.ApplyViaAgent == true)
+            {
+                Console.WriteLine("\n-- Apply via agent ---------------------------------------------");
+
+                var steps = plan.SelfAgentSteps;
+
+                if (steps.Count == 0)
+                    Console.WriteLine("  Nothing server-scoped for this box in this run.");
+                else if (!NothingFailedYet(report))
+                    Console.WriteLine("  Build, tests or an inline step failed -- nothing handed to the agent.");
+                else
+                {
+                    var shipped = SelfViaAgent.Ship(plan, steps, stagingRoot, keepRuns, report);
+                    var error   = report.Propagation.Last().ErrorMessage;
+
+                    foreach (var step in steps)
+                        ProjectResult(report, step.Project).TargetResults.Add(SelfViaAgent.HandedOff(step, shipped, error));
+                }
+            }
+            else if (plan.Self.ApplyViaAgent is null)
+            {
+                var denied = attempts.Where(a => AccessDenied.Looks(a.Result)).ToList();
+
+                if (denied.Count > 0)
+                    HandDeniedToAgent(plan, denied, stagingRoot, keepRuns, report);
             }
 
             // -- Propagate to peers -------------------------------------------
@@ -623,14 +673,21 @@ internal class Program
     {
         foreach (var server in plan.ServerPlans)
         {
-            var role     = server.IsSelf ? "self, primary" : "peer";
+            var role     = server.IsSelf
+                ? server.ApplyViaAgent switch
+                {
+                    true  => "self, primary, applies via agent",
+                    null when server.IncomingShare is not null => "self, primary, agent on access denied",
+                    _     => "self, primary"
+                }
+                : "peer";
             var excluded = server.Selected ? string.Empty : ", excluded by srv:";
             Console.WriteLine($"  {server.ServerName}  [{role}{excluded}]  {server.Steps.Count} step(s)");
 
             // Where a peer's run folder is going, and who it will be written as. Both come
             // from config and were previously invisible until propagation failed - which
             // happens after the build, so a stale or mistyped share cost a full run to find.
-            if (!server.IsSelf && server.Selected)
+            if ((!server.IsSelf || server.IncomingShare is not null) && server.Selected)
             {
                 Console.WriteLine($"      → {server.IncomingShare ?? "(no incomingShare configured!)"}");
 
@@ -666,7 +723,8 @@ internal class Program
         RolloutPlan plan,
         Dictionary<DeployType, IDeployTypeHandler> handlers,
         ProjectRegistry registry,
-        string stagingRoot)
+        string stagingRoot,
+        List<(ApplyStep Step, ProjectDeployResult Project, TargetDeployResult Result)> attempts)
     {
         var result = new ProjectDeployResult { ProjectName = project.Name };
 
@@ -742,6 +800,15 @@ internal class Program
             }
 
             // -- Apply ---------------------------------------------------------
+            // applyViaAgent = true: server-scoped steps are not this process's to run. They go
+            // to this box's agent after every project is built; nothing is recorded here so the
+            // report gets one entry per target, added at handoff.
+            if (plan.Self.ApplyViaAgent == true && targetPlan.Scope == DeployScope.Server)
+            {
+                Console.WriteLine("  → Handed to this box's agent once every project is built.");
+                continue;
+            }
+
             // Self's plan is the authority on what runs here. An srv: directive that excludes
             // this box empties it (bar Global steps), and the build above still had to happen -
             // the artifacts are what the peers are waiting for.
@@ -763,6 +830,10 @@ internal class Program
                 .ApplyAsync(targetPlan.Step.RebasedTo(stagingRoot));
             result.TargetResults.Add(targetResult);
 
+            // Recorded with its step so that, with applyViaAgent = null, an access-denied
+            // failure can be handed to the agent afterwards.
+            attempts.Add((targetPlan.Step, result, targetResult));
+
             if (!targetResult.Success)
                 Console.WriteLine($"  ✗ {targetResult.ErrorMessage}");
             else
@@ -772,6 +843,59 @@ internal class Program
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Whether anything so far went wrong, without requiring anything to have gone right -
+    /// a project whose only targets are going to the agent has no target results yet.
+    /// </summary>
+    private static bool NothingFailedYet(DeployReport report) => report.Results.All(r =>
+        !r.TestsFailed &&
+        r.PreBuildResults.All(s => s.Success) &&
+        r.PublishResults.All(p => p.Success) &&
+        r.TargetResults.All(t => t.Success));
+
+    private static ProjectDeployResult ProjectResult(DeployReport report, string project)
+        => report.Results.First(r => r.ProjectName.Equals(project, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// applyViaAgent = null, second attempt. Says what this account could not do, then hands
+    /// exactly those targets to the agent if this host's servers[] entry gives it a share.
+    /// A handed-off target's inline failure is overwritten by the handoff outcome - the
+    /// agent's own result.json is the record of what happened next.
+    /// </summary>
+    private static void HandDeniedToAgent(
+        RolloutPlan plan,
+        List<(ApplyStep Step, ProjectDeployResult Project, TargetDeployResult Result)> denied,
+        string stagingRoot,
+        int keepRuns,
+        DeployReport report)
+    {
+        Console.WriteLine("\n-- Access denied -----------------------------------------------");
+        Console.WriteLine($"  ✗ {denied.Count} target(s) failed with access denied while running as {AccessDenied.CurrentIdentity()}:");
+        foreach (var (step, _, result) in denied)
+            Console.WriteLine($"      {step.Project,-22} {result.TargetLabel}");
+        Console.WriteLine();
+        Console.WriteLine("    Controlling IIS, stopping services and writing under protected paths need a local");
+        Console.WriteLine("    Administrator. Either run the CI runner service as one (or as SYSTEM), or install the");
+        Console.WriteLine("    agent on this box (dytools-deploy install-agent) and give this host's servers[] entry");
+        Console.WriteLine("    an incomingShare, so these steps can be handed to it - it runs as SYSTEM.");
+
+        if (!plan.SelfCanHandOff)
+        {
+            Console.WriteLine($"\n  No incomingShare on this host's servers[] entry ('{plan.Self.ServerName}') -- nothing to hand off to.");
+            return;
+        }
+
+        var steps   = denied.Select(d => d.Step).ToList();
+        var shipped = SelfViaAgent.Ship(plan, steps, stagingRoot, keepRuns, report);
+        var error   = report.Propagation.Last().ErrorMessage;
+
+        foreach (var (step, project, result) in denied)
+        {
+            var index = project.TargetResults.IndexOf(result);
+            project.TargetResults[index] = SelfViaAgent.HandedOff(step, shipped, error);
+        }
     }
 
     // -- Pre-build -------------------------------------------------------------
@@ -1030,7 +1154,8 @@ internal class Program
             {
                 var tIcon    = t.Success ? "✓" : "✗";
                 var rollback = t.RolledBack ? " [ROLLED BACK]" : string.Empty;
-                Console.WriteLine($"        {tIcon} {t.TargetLabel}{rollback}");
+                var via      = t.AppliedBy is null ? string.Empty : $" [via {t.AppliedBy}]";
+                Console.WriteLine($"        {tIcon} {t.TargetLabel}{rollback}{via}");
 
                 if (!t.Success && t.ErrorMessage is not null)
                     Console.WriteLine($"           Error: {t.ErrorMessage}");

@@ -296,6 +296,44 @@ the others are still delivered.
 | `delaySeconds` | int | `3600` | Soak time between the primary going live and peers applying. Clock starts at **primary success**. Overridden per run by `wait:` / `--wait`. |
 | `keepRuns` | int | `5` | Run folders retained per peer before the oldest are pruned. |
 | `precheckPeers` | bool | `true` | Verify every peer is reachable and writable **before building**, and abort if one is not. Off = the run still fails, just after a full build. `--no-precheck` overrides per run. |
+| `applyViaAgent` | bool? | `null` | Who applies this box's server-scoped steps. `true`: always the agent installed here, fire and forget like a peer. `false`: always this process, inline. `null`: inline first, then hand any target that failed with **access denied** to the agent. See [When the runner lacks rights](#when-the-runner-lacks-rights). |
+
+### When the runner lacks rights
+
+Stopping an app pool, stopping a service, or writing under `C:\inetpub` needs a local
+Administrator, and a self-hosted Actions runner installs as `NETWORK SERVICE`, which is not one.
+The symptom is `appcmd` failing with *"Cannot read configuration file due to insufficient
+permissions"* on `redirection.config`, or `sc` with *"Access is denied"*. Two ways out:
+
+- **Run the runner service as an Administrator or as `SYSTEM`.** Nothing else changes.
+- **Install the agent on the primary too** and give this host's own `servers[]` entry an
+  `incomingShare` (`install-agent` prints it). The runner then needs build tools and write access
+  to that folder, and nothing else.
+
+With an `incomingShare` on its own entry the primary can treat itself as one more peer: same
+precheck, same run folder - manifest, artifacts, the tool itself - and, like a peer, **fire and
+forget**: the run folder lands, the agent applies it on its next poll, and the agent's own
+`agent.log` and `result.json` are the record of what happened. The only difference from a peer is
+that the steps are due immediately. `rollout.applyViaAgent` decides when that happens:
+
+| | Inline attempt | Handed to the agent |
+|---|---|---|
+| `true` | Global-scope steps only (a Velopack upload needs no rights here) | every server-scoped step, once the build and tests pass |
+| `null` (default) | everything | only targets that failed inline with an access-denied signature - IIS and folder alike |
+| `false` | everything | nothing; a permissions failure fails the run |
+
+In this run's `result.json` a handed-off target is `appliedBy: "agent"` and succeeds when the
+handoff landed - the summary shows it `[via agent]`. Failures that are not permissions failures
+are never handed off; retrying them as `SYSTEM` would only repeat them.
+
+Note what fire-and-forget means for the fleet: peers' soak clock starts when the primary's run
+finishes, which for a handed-off target is when the handoff landed, not when the agent finished
+applying. If you need this box proven live before peers go, use `false` and run the runner as an
+Administrator.
+
+Anything that can write to the incoming folder gets its steps run as `SYSTEM` - that is the trust
+model for peers already, and a share on the primary's own entry adds the runner's account to it.
+Keep that folder's ACL tight.
 
 ### Deploying to some servers only
 

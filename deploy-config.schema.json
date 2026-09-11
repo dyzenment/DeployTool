@@ -199,6 +199,13 @@
         "precheckPeers": {
           "type": "boolean",
           "description": "Prove every peer is reachable and writable before building, and abort the run if one is\nnot. On by default: propagation is the last thing a run does, so without it an\nunreachable peer costs the whole build and test cycle to discover.\n            \nTurn it off only if you would rather a peer that is down not block a deploy to the boxes\nthat are up - the run will still fail at propagation, just later."
+        },
+        "applyViaAgent": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Who applies the primary\u0027s server-scoped steps on this box.\n            \n  true  - always the agent installed here (SYSTEM). Fire and forget, like a peer: the\n          run folder lands under this host\u0027s own incomingShare and the agent applies\n          it on its next poll. Requires a servers[] entry for this host with an\n          incomingShare.\n  false - always this process, inline. A permissions failure fails the run.\n  null  - inline first; a target that fails with access denied (the CI runner\u0027s account\n          cannot control IIS, stop a service, or write the destination) is then handed\n          to the agent, if this host\u0027s servers[] entry has an incomingShare. Default.\n            \nGlobal-scope steps (a Velopack upload) always run inline - they need no rights here."
         }
       }
     },
