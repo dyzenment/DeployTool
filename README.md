@@ -326,6 +326,14 @@ In this run's `result.json` a handed-off target is `appliedBy: "agent"` and succ
 handoff landed - the summary shows it `[via agent]`. Failures that are not permissions failures
 are never handed off; retrying them as `SYSTEM` would only repeat them.
 
+An IIS target asks the permissions question before it acts on it. One read-only
+`appcmd list apppool` runs ahead of the load-balancer precheck, and a denial there abandons the
+target immediately - `Precheck IIS access` in the report - so a box that was never going to be
+deployable is not drained out of rotation and put back having had nothing done to it. The probe
+only ever stops on a positive denial: an unknown pool, a missing `appcmd`, or any other failure
+falls through to the real steps. A pool that reads fine and still refuses to stop takes the
+original path, drain and restore included.
+
 Note what fire-and-forget means for the fleet: peers' soak clock starts when the primary's run
 finishes, which for a handed-off target is when the handoff landed, not when the agent finished
 applying. If you need this box proven live before peers go, use `false` and run the runner as an

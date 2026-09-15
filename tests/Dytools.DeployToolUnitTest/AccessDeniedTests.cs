@@ -23,6 +23,61 @@ public sealed class AccessDeniedTests
         StepName = "x", ExitCode = exit, Success = exit == 0, Stderr = stderr, Stdout = stdout
     };
 
+    // -- Single step, as the IIS probe asks it ---------------------------------
+    //
+    // IisHandler runs one read-only `appcmd list apppool` before anything is stopped or drained,
+    // and aborts the target on a positive denial so it goes straight to the agent. The rule has
+    // to be the same one used afterwards: a probe that said "denied" where Looks(result) would
+    // not would abort a target and then fail to hand it off, which is worse than not probing.
+
+    [TestMethod]
+    public void Probe_RedirectionConfigError_Blocks()
+    {
+        // The field failure, as the probe would see it: the read itself is what is refused, so
+        // it shows up identically whether the command was `list` or `stop`.
+        var probe = Step(1168, stdout: "ERROR ( message:Configuration error\n\nFilename: redirection.config\n" +
+                                       "Description: Cannot read configuration file due to insufficient permissions\n. )");
+
+        Assert.IsTrue(AccessDenied.Looks(probe));
+    }
+
+    [TestMethod]
+    public void Probe_SucceedingIsNeverBlocked()
+        => Assert.IsFalse(AccessDenied.Looks(Step(0, stdout: "Started")));
+
+    [TestMethod]
+    public void Probe_UnknownAppPool_DoesNotBlock()
+    {
+        // appcmd exits 1168 with nothing on stdout for a pool that is not there. Reading that as
+        // denied would abort before the real step could report the actual problem.
+        Assert.IsFalse(AccessDenied.Looks(Step(1168)),
+            "an inconclusive probe must fall through to the real steps, not guess");
+    }
+
+    [TestMethod]
+    public void Probe_MissingAppcmd_DoesNotBlock()
+        => Assert.IsFalse(AccessDenied.Looks(Step(-1, stderr: "Executable not found: appcmd.exe")),
+            "a broken probe is not evidence about permissions");
+
+    [TestMethod]
+    public void Probe_ExitFiveBlocks()
+        => Assert.IsTrue(AccessDenied.Looks(Step(5, stderr: "Access is denied.")));
+
+    [TestMethod]
+    public void ProbeAbortMessage_IsClassifiedAsAccessDenied()
+    {
+        // What IisHandler returns when the probe blocks. It carries no failing appcmd step of its
+        // own beyond the probe, so the ErrorMessage has to be enough on its own for Program.cs to
+        // route it to the agent.
+        var aborted = Failed(
+            "Cannot control app pool 'ShipSystem' as NT AUTHORITY\\NETWORK SERVICE - access is denied. " +
+            "Nothing was stopped, drained or copied.");
+
+        Assert.IsTrue(AccessDenied.Looks(aborted),
+            "an early abort must still be handed to the agent, or the probe would turn a " +
+            "recoverable deploy into a hard failure");
+    }
+
     [TestMethod]
     public void SuccessfulTarget_IsNeverAccessDenied()
     {

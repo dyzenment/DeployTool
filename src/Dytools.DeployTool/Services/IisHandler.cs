@@ -29,7 +29,19 @@ public sealed class IisHandler : IDeployTypeHandler
         var tokens    = new TokenContext(iis.SiteName, step.Project);
         var lb        = iis.LoadBalancer;
 
-        // Ask first whether this instance is in rotation at all. A box that is already out of
+        // Ask whether this account can drive IIS at all, before anything is stopped or drained.
+        //
+        // Without this the wasted path is long and visible to users: precheck, drain, fail on the
+        // first appcmd, restore, hand off to the agent, and the agent then repeats the whole
+        // routine. The site is taken out of rotation and put back having had nothing done to it.
+        //
+        // The probe cannot promise the deploy will work - a pool can be readable and still refuse
+        // to stop - so the existing drain/fail/restore/hand-off path stays exactly as it was for
+        // everything it does not catch. All this does is catch the case that is knowable up front.
+        var accessDenied = await ProbeControlAccessAsync(iis, step);
+        if (accessDenied is not null) return accessDenied;
+
+        // Ask next whether this instance is in rotation at all. A box that is already out of
         // it - stopped site, maintenance, a flag flipped by hand - takes the plain routine:
         // draining something already drained is pointless, and on an offline box the drain
         // notification cannot even be delivered, which would abort the deploy outright.
@@ -347,6 +359,46 @@ public sealed class IisHandler : IDeployTypeHandler
         }
 
         return (result, liveModified);
+    }
+
+    // -- Access probe ----------------------------------------------------------
+
+    /// <summary>
+    /// Reads the app pool's state - the cheapest appcmd call that still goes through
+    /// applicationHost.config, which is what a non-Administrator is actually stopped by.
+    ///
+    /// Returns a failed result to abort on, or null to carry on. Only a positive access-denied
+    /// signal aborts: a pool that does not exist, a missing appcmd, or any other failure falls
+    /// through to the real steps, which report it far better than a probe could. Guessing from an
+    /// inconclusive probe would block deploys that work today.
+    /// </summary>
+    private static async Task<TargetDeployResult?> ProbeControlAccessAsync(IisConfig iis, ApplyStep step)
+    {
+        // IIS is Windows-only; elsewhere this would just be a guaranteed "executable not found".
+        if (!OperatingSystem.IsWindows() || string.IsNullOrWhiteSpace(iis.AppPool)) return null;
+
+        var probe = await AppCmdAsync("Precheck IIS access",
+            $"list apppool \"{iis.AppPool}\" /text:state");
+
+        if (!AccessDenied.Looks(probe)) return null;
+
+        // Phrased to contain the phrase the classifier looks for, so this reads as access denied
+        // from ErrorMessage alone and gets handed to the agent like any inline denial would.
+        var message =
+            $"Cannot control app pool '{iis.AppPool}' as {AccessDenied.CurrentIdentity()} - access is denied. " +
+            "Nothing was stopped, drained or copied.";
+
+        Console.WriteLine($"  [IIS] ✗ {message}");
+
+        var result = new TargetDeployResult
+        {
+            TargetLabel  = step.Label,
+            Type         = DeployType.Iis,
+            Success      = false,
+            ErrorMessage = message
+        };
+        result.DeploySteps.Add(probe);
+        return result;
     }
 
     // -- Helpers ---------------------------------------------------------------

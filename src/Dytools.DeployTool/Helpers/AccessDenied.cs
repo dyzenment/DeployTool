@@ -29,10 +29,17 @@ public static class AccessDenied
         if (result.Success) return false;
         if (Matches(result.ErrorMessage)) return true;
 
-        return result.DeploySteps.Any(step =>
-            !step.Success &&
-            (step.ExitCode is 5 or 740 || Matches(step.Stderr) || Matches(step.Stdout)));
+        return result.DeploySteps.Any(Looks);
     }
+
+    /// <summary>
+    /// The same judgement about one step. Split out so a probe can ask the question before
+    /// anything has been stopped, using exactly the rule that classifies it afterwards - if the
+    /// two ever disagreed, a target would be skipped early and then not handed to the agent.
+    /// </summary>
+    public static bool Looks(StepResult step)
+        => !step.Success &&
+           (step.ExitCode is 5 or 740 || Matches(step.Stderr) || Matches(step.Stdout));
 
     public static bool Matches(string? text)
     {
