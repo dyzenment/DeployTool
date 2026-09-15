@@ -365,7 +365,7 @@ public sealed class IisHandler : IDeployTypeHandler
 
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(WarmupTimeoutSeconds) };
+            using var http = ProbeHttp.Create(TimeSpan.FromSeconds(WarmupTimeoutSeconds));
             var response = await http.GetAsync(url);
 
             result.Stdout   = $"HTTP {(int)response.StatusCode} {response.ReasonPhrase}";
@@ -375,10 +375,10 @@ public sealed class IisHandler : IDeployTypeHandler
         }
         catch (Exception ex)
         {
-            result.Stderr   = ex.Message;
+            result.Stderr   = ProbeHttp.Describe(ex);
             result.Success  = false;
             result.ExitCode = -1;
-            Console.Error.WriteLine($"  │  ERR {ex.Message}");
+            Console.Error.WriteLine($"  │  ERR {result.Stderr}");
         }
 
         result.CompletedAt = DateTimeOffset.Now;

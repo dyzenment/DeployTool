@@ -106,7 +106,7 @@ public static class LoadBalancerGate
 
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(hook.TimeoutSeconds) };
+            using var http = ProbeHttp.Create(TimeSpan.FromSeconds(hook.TimeoutSeconds));
             using var request = new HttpRequestMessage(new HttpMethod(hook.Method.ToUpperInvariant()), url);
 
             if (hook.Headers is not null)
@@ -129,7 +129,7 @@ public static class LoadBalancerGate
         {
             result.ExitCode = -1;
             result.Success  = false;
-            result.Stderr   = ex.Message;
+            result.Stderr   = ProbeHttp.Describe(ex);
         }
 
         result.CompletedAt = DateTimeOffset.Now;
@@ -183,6 +183,10 @@ public static class LoadBalancerGate
     /// A stopped site refuses connections, and that is precisely the offline-box case this
     /// exists to handle, so an unreachable endpoint is an answer rather than an error.
     ///
+    /// A failed TLS handshake is the exception to that. Something is listening, we just cannot
+    /// speak to it, so it is not evidence of anything - and guessing "offline" there stops a live
+    /// site without draining it. That case assumes in rotation instead.
+    ///
     /// Never reports failure: "not in rotation" is a routing decision, not a broken deploy.
     /// </summary>
     public static async Task<(bool InRotation, StepResult Step)> PrecheckAsync(
@@ -204,15 +208,24 @@ public static class LoadBalancerGate
 
         var poll = await PollAsync(url, precheck.LiveStatus, precheck.TimeoutSeconds, precheck.IntervalSeconds);
 
+        // A handshake that never completed tells us nothing about rotation state - only that the
+        // probe itself is broken. Reading that as "offline" is how a live box gets its app pool
+        // bounced without a drain, so it falls back to the same assumption a missing url does.
+        var inRotation = poll.Matched || poll.HandshakeFailed;
+
         var summary = poll.Matched
             ? $"HTTP {precheck.LiveStatus} - in rotation, running drain/restore."
-            : $"Never returned HTTP {precheck.LiveStatus} in {poll.Elapsed.TotalSeconds:F1}s " +
-              $"({poll.Attempts} attempts, last: {poll.Last}) - already out of rotation, " +
-              "skipping drain/restore.";
+            : poll.HandshakeFailed
+                ? $"Could not complete a TLS handshake in {poll.Elapsed.TotalSeconds:F1}s " +
+                  $"({poll.Attempts} attempts, last: {poll.Last}) - rotation state unknown, " +
+                  "assuming in rotation and running drain/restore."
+                : $"Never returned HTTP {precheck.LiveStatus} in {poll.Elapsed.TotalSeconds:F1}s " +
+                  $"({poll.Attempts} attempts, last: {poll.Last}) - already out of rotation, " +
+                  "skipping drain/restore.";
 
-        Console.WriteLine($"  └- {(poll.Matched ? "✓" : "•")} {summary}");
+        Console.WriteLine($"  └- {(poll.Matched ? "✓" : poll.HandshakeFailed ? "!" : "•")} {summary}");
 
-        return (poll.Matched, new StepResult
+        return (inRotation, new StepResult
         {
             StepName    = "lb precheck",
             Command     = $"GET {url} == {precheck.LiveStatus}",
@@ -260,7 +273,8 @@ public static class LoadBalancerGate
 
     // -- Polling ---------------------------------------------------------------
 
-    private readonly record struct PollOutcome(bool Matched, int Attempts, TimeSpan Elapsed, string Last);
+    private readonly record struct PollOutcome(
+        bool Matched, int Attempts, TimeSpan Elapsed, string Last, bool HandshakeFailed);
 
     /// <summary>
     /// Polls a URL until it answers with the expected status or the timeout expires. Shared by
@@ -269,13 +283,14 @@ public static class LoadBalancerGate
     /// </summary>
     private static async Task<PollOutcome> PollAsync(string url, int expected, int timeoutSeconds, int intervalSeconds)
     {
-        var elapsed  = Stopwatch.StartNew();
-        var interval = TimeSpan.FromSeconds(Math.Max(1, intervalSeconds));
-        var timeout  = TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds));
-        var last     = "no response";
-        var attempts = 0;
+        var elapsed   = Stopwatch.StartNew();
+        var interval  = TimeSpan.FromSeconds(Math.Max(1, intervalSeconds));
+        var timeout   = TimeSpan.FromSeconds(Math.Max(1, timeoutSeconds));
+        var last      = "no response";
+        var attempts  = 0;
+        var handshake = false;
 
-        using var http = new HttpClient { Timeout = interval };
+        using var http = ProbeHttp.Create(interval);
 
         while (true)
         {
@@ -286,19 +301,22 @@ public static class LoadBalancerGate
                 var status = (int)response.StatusCode;
                 last = $"HTTP {status}";
 
+                handshake = false;
+
                 if (status == expected)
-                    return new PollOutcome(true, attempts, elapsed.Elapsed, last);
+                    return new PollOutcome(true, attempts, elapsed.Elapsed, last, false);
             }
             catch (Exception ex)
             {
                 // A refused connection is a legitimate answer while a site is stopped, so keep
                 // polling rather than treating the first exception as final.
-                last = ex.Message;
+                last      = ProbeHttp.Describe(ex);
+                handshake = ProbeHttp.IsHandshakeFailure(ex);
             }
 
             // Checked after an attempt, not before, so a zero or tiny timeout still asks once.
             if (elapsed.Elapsed >= timeout)
-                return new PollOutcome(false, attempts, elapsed.Elapsed, last);
+                return new PollOutcome(false, attempts, elapsed.Elapsed, last, handshake);
 
             await Task.Delay(interval);
         }

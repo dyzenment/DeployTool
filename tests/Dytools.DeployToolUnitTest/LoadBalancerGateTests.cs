@@ -1,4 +1,10 @@
 using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using Dytools.DeployTool.Helpers;
 using Dytools.DeployTool.Models.Config;
 using Dytools.DeployTool.Models.Reporting;
 using Dytools.DeployTool.Services;
@@ -312,6 +318,100 @@ public sealed class LoadBalancerGateTests
         StringAssert.Contains(step.Command, Environment.MachineName);
     }
 
+    [TestMethod]
+    public async Task Precheck_FailedHandshake_AssumesInRotation()
+    {
+        // The bug this guards: an https://localhost probe against a certificate issued for the
+        // box's real hostname fails the handshake, which says nothing about rotation state. Read
+        // as "offline" it skipped the drain and the app pool was bounced under live traffic.
+        using var server = new TlsStubServer();
+
+        var (inRotation, step) = await LoadBalancerGate.PrecheckAsync(
+            new LoadBalancerPrecheck { Url = server.BrokenHandshakeUrl, TimeoutSeconds = 2, IntervalSeconds = 1 },
+            Tokens);
+
+        Assert.IsTrue(inRotation,
+            "a probe that cannot complete a handshake is broken, not proof the box is out of rotation");
+        Assert.IsTrue(step.Success);
+        StringAssert.Contains(step.Stdout, "rotation state unknown");
+    }
+
+    [TestMethod]
+    public async Task Precheck_LoopbackCertificateIsTrusted()
+    {
+        // The fix for the original symptom: a self-signed cert on localhost should be probed
+        // successfully rather than rejected for not chaining to a trusted root.
+        using var server = new TlsStubServer();
+
+        var (inRotation, _) = await LoadBalancerGate.PrecheckAsync(
+            new LoadBalancerPrecheck { Url = server.Url, LiveStatus = 200 }, Tokens);
+
+        Assert.IsTrue(inRotation, "loopback certificate errors are ignored by design");
+    }
+
+    // -- Error reporting -------------------------------------------------------
+
+    [TestMethod]
+    public void Describe_UnwrapsInnerExceptions()
+    {
+        var ex = new HttpRequestException(
+            "The SSL connection could not be established, see inner exception.",
+            new AuthenticationException("The remote certificate is invalid."));
+
+        var described = ProbeHttp.Describe(ex);
+
+        StringAssert.Contains(described, "The remote certificate is invalid.",
+            "logging only the outer message is what made this undiagnosable from the report");
+    }
+
+    [TestMethod]
+    public void IsHandshakeFailure_DistinguishesTlsFromARefusedConnection()
+    {
+        Assert.IsTrue(ProbeHttp.IsHandshakeFailure(
+            new HttpRequestException("ssl", new AuthenticationException("bad cert"))));
+
+        Assert.IsFalse(ProbeHttp.IsHandshakeFailure(
+            new HttpRequestException("refused", new SocketException((int)SocketError.ConnectionRefused))),
+            "a refused connection is a real answer about the site, not a broken probe");
+    }
+
+    [TestMethod]
+    public void ValidateCertificate_LoopbackIsAccepted_EvenWhenTheCertificateIsBad()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://localhost/api/health");
+
+        Assert.IsTrue(ProbeHttp.ValidateCertificate(
+            request, null, null, SslPolicyErrors.RemoteCertificateNameMismatch));
+    }
+
+    [TestMethod]
+    public void ValidateCertificate_NonLoopbackRejectionNamesTheActualErrors()
+    {
+        // Returning false here would report only "rejected by the provided
+        // RemoteCertificateValidationCallback", which is less than the runtime says without any
+        // callback at all - a diagnosis worse than the one being fixed.
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://web01.example.com/api/health");
+
+        var thrown = Assert.ThrowsException<AuthenticationException>(() => ProbeHttp.ValidateCertificate(
+            request, null, null,
+            SslPolicyErrors.RemoteCertificateNameMismatch | SslPolicyErrors.RemoteCertificateChainErrors));
+
+        StringAssert.Contains(thrown.Message, "RemoteCertificateNameMismatch");
+        StringAssert.Contains(thrown.Message, "RemoteCertificateChainErrors");
+        StringAssert.Contains(thrown.Message, "web01.example.com");
+        Assert.IsTrue(ProbeHttp.IsHandshakeFailure(thrown),
+            "the thrown detail must still read as a handshake failure, or the precheck would " +
+            "treat a bad certificate as an offline box again");
+    }
+
+    [TestMethod]
+    public void ValidateCertificate_AValidCertificateIsAcceptedAnywhere()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://web01.example.com/api/health");
+
+        Assert.IsTrue(ProbeHttp.ValidateCertificate(request, null, null, SslPolicyErrors.None));
+    }
+
     // -- Tokens ----------------------------------------------------------------
 
     [TestMethod]
@@ -389,6 +489,121 @@ public sealed class LoadBalancerGateTests
         {
             _cts.Cancel();
             _listener.Close();
+            _cts.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Loopback TLS fixture for the two certificate cases.
+    ///
+    /// <see cref="Url"/> serves HTTPS under a self-signed certificate that chains to nothing -
+    /// the shape of a real IIS box seen from localhost, and what the loopback exemption exists
+    /// for. <see cref="BrokenHandshakeUrl"/> accepts the connection and then answers with bytes
+    /// that are not TLS, which fails the handshake the same way a rejected certificate does:
+    /// something is listening, the client cannot talk to it, and no HTTP status is ever reached.
+    ///
+    /// Raw sockets rather than HttpListener because binding an HTTPS prefix needs netsh on
+    /// Windows, and these tests should run anywhere.
+    /// </summary>
+    private sealed class TlsStubServer : IDisposable
+    {
+        private const string Response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+        private readonly TcpListener _tls;
+        private readonly TcpListener _garbage;
+        private readonly X509Certificate2 _certificate;
+        private readonly CancellationTokenSource _cts = new();
+
+        public string Url { get; }
+        public string BrokenHandshakeUrl { get; }
+
+        public TlsStubServer()
+        {
+            _certificate = SelfSigned();
+
+            _tls = new TcpListener(IPAddress.Loopback, 0);
+            _tls.Start();
+            Url = $"https://127.0.0.1:{((IPEndPoint)_tls.LocalEndpoint).Port}/health";
+
+            _garbage = new TcpListener(IPAddress.Loopback, 0);
+            _garbage.Start();
+            BrokenHandshakeUrl = $"https://127.0.0.1:{((IPEndPoint)_garbage.LocalEndpoint).Port}/health";
+
+            _ = Task.Run(() => ServeAsync(_tls, tls: true));
+            _ = Task.Run(() => ServeAsync(_garbage, tls: false));
+        }
+
+        private async Task ServeAsync(TcpListener listener, bool tls)
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                TcpClient client;
+                try { client = await listener.AcceptTcpClientAsync(_cts.Token); }
+                catch { return; }
+
+                _ = Task.Run(async () =>
+                {
+                    using (client)
+                    {
+                        try
+                        {
+                            await using var network = client.GetStream();
+
+                            if (!tls)
+                            {
+                                // Not a TLS record, so the client's handshake fails rather than
+                                // its certificate check - the distinction under test.
+                                await network.WriteAsync("not tls at all\r\n\r\n"u8.ToArray(), _cts.Token);
+                                return;
+                            }
+
+                            await using var ssl = new SslStream(network, leaveInnerStreamOpen: false);
+                            await ssl.AuthenticateAsServerAsync(_certificate, false, checkCertificateRevocation: false);
+
+                            // One read is enough: the point is to drain the request so the client
+                            // is not writing into a full buffer, not to parse it.
+#pragma warning disable CA2022
+                            var buffer = new byte[4096];
+                            await ssl.ReadAsync(buffer, _cts.Token);
+#pragma warning restore CA2022
+                            await ssl.WriteAsync(System.Text.Encoding.ASCII.GetBytes(Response), _cts.Token);
+                            await ssl.FlushAsync(_cts.Token);
+                        }
+                        catch
+                        {
+                            // A client that hangs up mid-handshake is one of the cases being
+                            // provoked here, not a fixture failure.
+                        }
+                    }
+                });
+            }
+        }
+
+        /// <summary>
+        /// Exported and reloaded as a PFX because a certificate straight out of CreateSelfSigned
+        /// carries an ephemeral key that SslStream cannot use for server authentication.
+        /// </summary>
+        private static X509Certificate2 SelfSigned()
+        {
+            using var key = RSA.Create(2048);
+            var request = new CertificateRequest(
+                "CN=localhost", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+
+            request.CertificateExtensions.Add(
+                new X509EnhancedKeyUsageExtension([new Oid("1.3.6.1.5.5.7.3.1")], critical: false));
+
+            using var generated = request.CreateSelfSigned(
+                DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+
+            return X509CertificateLoader.LoadPkcs12(generated.Export(X509ContentType.Pfx), password: null);
+        }
+
+        public void Dispose()
+        {
+            _cts.Cancel();
+            _tls.Stop();
+            _garbage.Stop();
+            _certificate.Dispose();
             _cts.Dispose();
         }
     }
