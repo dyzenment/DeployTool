@@ -21,6 +21,11 @@ internal class Program
         // background I/O - is applied once deploy-config.json has been read, below.
         ResourceGovernor.ApplyDefaultPriority();
 
+        // Before anything prints. When output is redirected - the agent's poll script, or a CI
+        // job - every line gets a timestamp and loses any escape sequences, so agent.log reads
+        // as a log rather than as a transcript of a terminal nobody was sitting at.
+        LogConsole.InstallIfRedirected();
+
         // Subcommands are checked before the --config requirement below, so every one of them
         // works in a fresh repo - and, more to the point, on a peer, which has no repo and no
         // deploy-config.json at all. Leading dashes are tolerated on all of them because the

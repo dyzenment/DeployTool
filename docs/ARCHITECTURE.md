@@ -458,7 +458,8 @@ mirror → start).
 C:\deploy\
   agent\
     poll.cmd              <- the ONLY permanent file on a peer. Never changes.
-    agent.log             <- rolling; poll.cmd redirects here
+    agent.log             <- rolling; poll.cmd redirects here. UTF-8, one timestamp per
+                             line, escape sequences stripped (see LogConsole)
   staging\
     <runId>\              <- primary robocopies here (incomplete; ignored by the poller)
   incoming\

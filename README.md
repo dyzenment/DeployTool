@@ -437,7 +437,9 @@ the rest oldest-first, and writes a `result.json` into each.
 
 That `result.json` is the completion marker as well as the audit record: manifest present and no
 `result.json` means pending. It is written on failure too, so a broken run is recorded once rather
-than retried every minute forever. Watch it all in `C:\deploy\agent\agent.log`.
+than retried every minute forever. Watch it all in `C:\deploy\agent\agent.log`, where every line
+carries an `HH:mm:ss.fff` stamp and any colour codes a build tool emitted have been stripped out.
+An interactive run is unaffected - the log formatting only applies when output is redirected.
 
 The peer needs the .NET runtime installed - it does not need the SDK, a checkout, or a
 `deploy-config.json`. Everything it is meant to do arrives in the run folder's `manifest.json`.

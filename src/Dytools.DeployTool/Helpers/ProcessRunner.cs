@@ -67,6 +67,17 @@ public static class ProcessRunner
             CreateNoWindow         = true
         };
 
+        // Ask children not to colour their output in the first place. Stripping on the way
+        // through is what guarantees a clean log, but a tool that knows not to emit escapes also
+        // stops redrawing progress bars and printing spinner frames, which strip alone would
+        // leave as a column of near-identical lines. Only when we are writing to a file.
+        if (LogConsole.IsActive)
+        {
+            psi.Environment["NO_COLOR"] = "1";
+            psi.Environment["MSBUILDTERMINALLOGGER"] = "off";
+        }
+
+        // Caller-supplied values win: set after, so a step can override either of the above.
         if (environmentVariables is not null)
             foreach (var (key, value) in environmentVariables)
                 psi.Environment[key] = value;
